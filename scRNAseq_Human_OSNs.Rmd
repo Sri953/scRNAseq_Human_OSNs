@@ -1,0 +1,4180 @@
+---
+title: "scRNAseq"
+output: html_document
+date: "2025-01-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load Libraries 
+```{r}
+library(tidyverse)
+library(Seurat)
+library(scDblFinder)
+library(SingleCellExperiment)
+#library(SeuratWrappers)
+#library(SeuratDisk)
+library(patchwork)
+library(clustree)
+library(dplyr)
+library(Cairo)
+library(XML)
+library(pheatmap)
+library(biomaRt)
+library(tradeSeq)
+library(slingshot)
+library(destiny)
+library(ggrepel)
+library(clusterProfiler)
+library(rrvgo)
+```
+
+#Create metadata file
+```{r}
+metadata <- data.frame(
+  Path = c("../originals/GSE184117/control1",
+           "../originals/GSE184117/control2",
+           "../originals/GSE184117/control3",
+           "../originals/GSE139522/patient1",
+           "../originals/GSE139522/patient2",
+           "../originals/GSE139522/patient3",
+           "../originals/GSE139522/patient4"),
+  ID = c("control1", "control2", "control3", "patient1", "patient2",
+         "patient3", "patient4")
+)
+
+#write.csv(metadata, "../metadata/metadata.csv", row.names = FALSE, quote = FALSE)
+```
+
+#Create seurat objects in a list 
+```{r}
+samples.meta <- read.csv("../metadata/metadata.csv")
+
+## check if all paths are present
+all(file.exists(samples.meta$Path))
+
+
+samples.seuratlist <- apply(samples.meta, 1, function(line) {
+  sample.data <- Read10X(line[["Path"]])
+  
+  #Create Seurat object
+  sample.seurat <- CreateSeuratObject(counts = sample.data,
+                                      project = line[["ID"]],
+                                      min.features = 5)
+  sample.seurat$experiment <- "RNA"
+  
+  # Adding additional metadata
+  sample.seurat@meta.data <- mutate(sample.seurat@meta.data, !!!line)
+  
+  sample.seurat
+})
+
+names(samples.seuratlist) <- samples.meta$ID
+
+samples.seuratlist
+```
+
+#Quantify QC metrics
+## Calculate percent mitochondria
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    #calculates % of mitochondrial genes in RNA assay of each sample
+    sample$percent_mito <- PercentageFeatureSet(sample, pattern = "^MT-",assay = "RNA") 
+    #set identity class?
+    Idents(sample) <- "experiment"
+    sample
+})
+```
+
+## Find no of value of mitochondrial % under 20%
+```{r}
+sapply(samples.seuratlist[1:7], function(x) sum(x@meta.data$percent_mito < 20, na.rm = TRUE))
+```
+## For sample 1-3 plot mitochondria % distribution per experiment
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist[1:3], function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", layer = "counts") +
+        ggtitle(sample$orig.ident[1]) +
+        scale_y_continuous(limits = c(0,65))
+}))
+```
+
+## For sample 4-7 plot mitochondria % distribution per experiment
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist[4:7], function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", layer = "counts") +
+        ggtitle(sample$orig.ident[1]) +
+        scale_y_continuous(limits = c(0,65))
+}))
+```
+
+## Annotate doublets using scDblFinder
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    #Extract count matrix from each sample to identify potential doublets
+    sce <- scDblFinder(GetAssayData(sample, assay = "RNA", layer = "counts"))
+    #Store results in metadata of seurat object
+    sample$scDblFinder.class <- sce$scDblFinder.class
+    sample
+})
+```
+## Save Seurat List
+```{r}
+#saveRDS(samples.seuratlist, file = "../outputs/RDS_files/samples/samples.seuratlist.rds")
+```
+
+## Reload Seurat List
+```{r}
+samples.seuratlist <- readRDS("../outputs/RDS_files/samples/samples.seuratlist.rds")
+```
+
+## Calculate percent ribosomal
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    #calculates % of ribosomal genes in RNA assay for each sample
+    #^RP[SL] - ribosomal protein Small/Large subunit
+    sample$percent_ribo <- PercentageFeatureSet(sample, pattern = "^RP[SL]",assay = "RNA")
+    Idents(sample) <- "experiment"
+    sample
+})
+```
+
+## Plot ribosome % distribution per experiment
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist, function(sample){
+    VlnPlot(sample, "percent_ribo", group.by = "experiment", layer = "counts") +
+        ggtitle(sample$orig.ident[1]) +
+        scale_y_continuous(limits = c(0,65))
+}))
+```
+
+## Feature Scatter
+```{r}
+do.call(wrap_plots, lapply(samples.seuratlist[1], function(sample){
+  FeatureScatter(sample, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + #None should be found bottom right and top left 
+    ggtitle(sample$orig.ident[1]) +
+    geom_smooth(method = 'lm')}))
+```
+
+## Quantify cell cycle phase
+```{r}
+### run cell cycle scoring
+cc.genes <- cc.genes.updated.2019 #contains human cell cycle genes
+```
+
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+	sample <- NormalizeData(sample)
+    CellCycleScoring(sample, 
+                     s.features = cc.genes$s.genes, 
+                     g2m.features = cc.genes$g2m.genes, 
+                     set.ident = FALSE)
+})
+```
+
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist, function(sample){
+    sample@meta.data %>% 
+        ggplot(aes(x=Phase, fill = Phase)) + 
+        geom_bar() +
+        theme_minimal() +
+        scale_fill_brewer(palette = "Set2") +
+        ggtitle(sample$orig.ident[1]) 
+}))
+```
+
+## Run SCTransform and regress out CC-score
+```{r}
+options(future.globals.maxSize = 2 * 1024^3)  # Increase memory limit to 2 GB to account for large data set
+
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    SCTransform(sample, method = "glmGamPoi", 
+    		vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)#regresses out effect of cell cycle scores (s and G2M phases)
+})
+
+# Helps prevent clustering based on cell cycle differences rather than biological differences
+```
+
+## Save in RDS format
+```{r}
+#saveRDS(samples.seuratlist, file = "../outputs/RDS_files/samples/samples.seuratlistSCT.rds")
+```
+
+## Reload RDS file
+```{r}
+samples.seuratlist <- readRDS("../outputs/RDS_files/samples/samples.seuratlistSCT.rds")
+```
+
+## Filter out poor quality cells
+```{r}
+### check number of cells before qc
+ncell_before.v <- lapply(samples.seuratlist, ncol)
+unlist(ncell_before.v)
+```
+
+# 1st qc pass using median absolute deviation from the median
+```{r}
+qc.df <- do.call(rbind,lapply(samples.seuratlist, function(sample){
+    # feature cut off for 3 MADS below the median (cells few than this threshold = low quality)
+    feature.cutoff <- median(sample@meta.data$nFeature_SCT) - 3*mad(sample@meta.data$nFeature_SCT) 
+    #avoids removing too many cells so threshold cuts at 100 genes
+    feature.cutoff <- ifelse(feature.cutoff < 100, 100, feature.cutoff)
+    #Mito cut off for 3 MADS above the median. (cells high in mito% = dying or stressed)
+    mito.cutoff <- median(sample@meta.data$percent_mito) + 3*mad(sample@meta.data$percent_mito)
+    #Ensure mito does not exceed 10%
+    mito.cutoff <- ifelse(mito.cutoff > 10, 10, mito.cutoff)
+    return(data.frame(feature.cutoff = feature.cutoff,
+                      mito.cutoff = mito.cutoff))
+}))
+```
+
+##Apply filter
+```{r}
+samples.seuratlist.filt <- lapply(samples.seuratlist, function(sample) {
+    sample.id <- as.character(sample$orig.ident[1])
+    subset(sample, 
+           subset = nFeature_RNA > qc.df[sample.id,]$feature.cutoff & percent_mito < qc.df[sample.id,]$mito.cutoff)
+})
+```
+
+## Check number of cells
+```{r}
+ncell_after.v <- lapply(samples.seuratlist.filt, ncol)
+unlist(ncell_before.v) - unlist(ncell_after.v)
+```
+## Check metric distribution
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist.filt, function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+}))
+```
+
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist.filt, function(sample){
+    VlnPlot(sample, "nFeature_RNA", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+}))
+```
+
+```{r}
+# overwrite original object
+samples.seuratlist <- samples.seuratlist.filt
+```
+
+## Briefly normalize, scale, get variable features, and pca
+```{r}
+options(future.globals.maxSize = 2 * 1024^3)  # Increase memory limit to 2 GB to account for large data set
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    SCTransform(sample, method = "glmGamPoi", verbose = FALSE) #glmGamPoi estimates the overdispersion and fit repeated models for matrix input
+})
+```
+
+# 2nd qc pass: remove low quality clusters
+## Briefly cluster cells using higher resolution
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+	sample <- RunPCA(sample)
+    sample <- FindNeighbors(sample, dims = 1:50) # constructs knn graph using first 50 PCs
+    sample <- FindClusters(sample, resolution = 1.8) # Louvin clustering algorithm (High res)
+    sample
+})
+```
+
+## Check distribution of mito% and nFeature for control 1-3
+```{r}
+# Percent mito
+do.call(wrap_plots,lapply(samples.seuratlist[1:3], function(sample){
+    VlnPlot(sample, "percent_mito") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+
+# Features
+do.call(wrap_plots,lapply(samples.seuratlist[1:3], function(sample){
+    VlnPlot(sample, "nFeature_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+```
+
+## Check distribution of mito% and nFeature for control 4-7
+```{r}
+# Percent mito
+do.call(wrap_plots,lapply(samples.seuratlist[4:7], function(sample){
+    VlnPlot(sample, "percent_mito") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+
+# Features
+do.call(wrap_plots,lapply(samples.seuratlist[4:7], function(sample){
+    VlnPlot(sample, "nFeature_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+```
+
+##First round of removing cluster
+```{r}
+#Remove clusters with concomitantly low features (<1000) and high mito % (>2.5)
+
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    clusters <- sample@meta.data %>% 
+        group_by(seurat_clusters) %>% 
+        summarise(maxfeat = max(nFeature_RNA), 
+                  maxmito = max(percent_mito)) %>% 
+        filter(maxfeat >1000 | maxmito < 2.5) %>% 
+        pull(seurat_clusters)
+    subset(sample, idents = clusters)
+})
+
+```
+
+##Check distribution again for 1 exp
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist[1], function(sample){
+    VlnPlot(sample, "percent_mito") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+
+do.call(wrap_plots,lapply(samples.seuratlist[1], function(sample){
+    VlnPlot(sample, "nFeature_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+```
+
+##Second round of removing cluster
+```{r}
+#Remove clusters with concomitantly low features (<2000) and low RNA count (<4000)
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    clusters <- sample@meta.data %>% 
+        group_by(seurat_clusters) %>% 
+        summarise(maxfeat = max(nFeature_RNA), 
+                  maxcount = max(nCount_RNA)) %>% 
+        filter(maxfeat >2000 | maxcount > 4000) %>% 
+        pull(seurat_clusters)
+    subset(sample, idents = clusters)
+})
+```
+
+##Check distribution again
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist, function(sample){
+    VlnPlot(sample, "nCount_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+
+do.call(wrap_plots,lapply(samples.seuratlist, function(sample){
+    VlnPlot(sample, "nFeature_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+})) + plot_layout(ncol=1)
+```
+
+## Final SCTransform
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+    SCTransform(sample, method = "glmGamPoi", 
+    		vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+})
+```
+
+#Dimensional Reduction
+```{r}
+## Perform UMAP reduction
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+	sample <- RunPCA(sample) #Standard PC for complex systems default 50
+	sample <- RunTSNE(sample, dims = 1:50) #Standard for complex systems
+    sample <- RunUMAP(sample, dims = 1:50)
+    sample 
+})
+```
+
+```{r}
+unlist(lapply(samples.seuratlist, ncol))
+```
+
+```{r}
+## Check metric distribution
+do.call(wrap_plots,lapply(samples.seuratlist, function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+}))
+```
+
+```{r}
+do.call(wrap_plots,lapply(samples.seuratlist, function(sample){
+    VlnPlot(sample, "nFeature_RNA", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+}))
+```
+#Cell clustering
+## Determine the best clustering resolution
+```{r}
+### Set range of resolutions
+res.range <- seq(0.4, 3, 0.2)
+
+samples.seuratlist <- lapply(samples.seuratlist, function(obj){
+    DefaultAssay(obj) <- "SCT"
+    obj <- FindNeighbors(obj, dims = 1:50)
+    for(res in res.range){
+        obj <- FindClusters(obj, resolution = res)
+    }
+    obj
+})
+```
+
+### Plot clustree for each sample
+```{r}
+#Optimal res found 0.6-0.8
+lapply(samples.seuratlist, function(dat){
+    clustree::clustree(dat, prefix = "SCT_snn_res.")   
+}) 
+```
+
+## Calculate weighted sum of squares for each experiment
+This is another method of identifying the optimal clustering resolution.
+```{r}
+wss.all <- do.call(bind_rows,lapply(samples.seuratlist, function(sample){
+  wss.out <- do.call(bind_rows, lapply(res.range, function(k){
+
+    # get centroid per cluster
+    centroids <- aggregate(Embeddings(sample, reduction = "pca"),
+          sample[[paste0("SCT_snn_res.", k)]], 
+          mean) %>% 
+    column_to_rownames(paste0("SCT_snn_res.", k))
+    diffsq <- (Embeddings(sample, reduction = "pca") - 
+        centroids[sample@meta.data[[paste0("SCT_snn_res.", k)]],])^2
+    sdsq <- colSds(Embeddings(sample, reduction = "pca"))^2
+    wdiff <- diffsq/sdsq
+    
+    wss <- sum(sqrt(rowSums(wdiff)))
+    data.frame(clust=k, wss = wss)
+ }))
+  
+  wss.out %>% 
+    mutate(id = sample$orig.ident[1])
+}))
+```
+
+### Plot out WSS vs resolution
+```{r}
+wss.all %>% 
+  group_by(id) %>% 
+  mutate(scaled_wss = scale(wss)) %>% 
+  ggplot(aes(x=clust,y=scaled_wss,group=id, colour=id)) +
+  geom_line()
+
+#Graph should sort of plateau down to an elbow at 0.6/0.8 (to be similar to clustree), but instead roughly shows between 1 and 2.
+```
+
+## Cluster for real
+```{r}
+res <- 0.6 #change accordingly
+samples.seuratlist <- lapply(samples.seuratlist, function(sample){
+	sample <- FindNeighbors(sample, verbose = F)
+    sample <- FindClusters(sample, resolution = res, verbose = F)
+})
+
+lapply(samples.seuratlist, DimPlot)
+```
+
+###Visualise Dimplot
+```{r}
+DimPlot(samples.seuratlist$patient3, reduction = 'umap', group.by = 'Phase') #, cells.highlight = Id of cells)
+```
+
+# Checking for gene expression from gene list 
+```{r}
+library(readr)
+human_genes <- read_csv("../originals/Human_genes.csv")
+
+#Change Immature neurons to iOSN
+human_genes <- human_genes %>% mutate(cluster = ifelse(cluster == "Immature Neurons", "iOSN", cluster))
+
+#Change Mature neurons to mOSN
+human_genes <- human_genes %>% mutate(cluster = ifelse(cluster == "Mature Neurons", "mOSN", cluster))
+
+#Split dataframe
+human_genes_split <- split(human_genes, ~cluster)
+```
+
+##Import Mouse genes
+```{r}
+mouse_genes <- read_csv("../originals/Mouse_genes.csv")
+#Split 
+mouse_genes_split <- split(mouse_genes, ~cluster)
+```
+##Convert mouse genes into human
+```{r}
+mouse_genes_split <- lapply(mouse_genes_split, function(df) {
+  df$human_gene <- NA
+   out <- gprofiler2::gorth(df$gene,
+        source_organism = "mmusculus",
+        target_organism = "hsapiens"   #change target_organism accordingly
+   )
+   df$human_gene[out$input_number] <- out$ortholog_name
+   df
+})
+```
+
+##Remove NAs in Mouse_genes_split
+```{r}
+mouse_genes_split <- bind_rows(mouse_genes_split)
+
+#Remove NAs
+mouse_genes_split <- mouse_genes_split %>% filter(!is.na(human_gene))
+```
+
+## Add human_gene column to match mouse_gene_split
+```{r}
+human_genes_split <- bind_rows(human_genes_split)
+
+human_genes_split$human_gene <- human_genes_split$gene
+```
+
+##Combine the df
+```{r}
+combine <- rbind(human_genes_split, mouse_genes_split)
+```
+
+##Find distinct genes
+```{r}
+distinct_genes <- combine %>% distinct(human_gene, .keep_all = TRUE)
+```
+
+##Sort by logFC
+```{r}
+sort_logFC <- distinct_genes[order(-distinct_genes$avg_logFC),]
+```
+
+##Do all samples express the gene?
+```{r}
+#Replicate human_gene column from sort_logFC 
+all_genes <- data.frame(human_gene = sort_logFC$human_gene)
+
+#Named samples
+sample_names <- c("control1", "control2", "control3", "patient1", "patient2", "patient3", "patient4")
+
+#Create separate data frame to see if samples contain genes
+in_dataset_df <- bind_cols(lapply(sample_names, function(x){
+  sort_logFC$human_gene %in% rownames(samples.seuratlist[[x]][["SCT"]])
+}))
+  
+#Filter for true all 7
+filtered_sort_logFC <- sort_logFC[rowSums(in_dataset_df) == 7,]
+
+#Filter for 100 genes each cluster
+Top_200 <- filtered_sort_logFC %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_logFC, n = 100)
+names(samples.seuratlist)
+```
+
+```{r}
+Top_200 <- split(Top_200, ~cluster) #A list of 2 data frames
+
+#For module scoring
+Top_200_list <- lapply(Top_200, function(df) df$human_gene)
+top <- as.data.frame(Top_200_list)
+```
+
+# Generate module scores
+```{r}
+samples.seuratlist <- lapply(samples.seuratlist, function(x) {
+  x <- AddModuleScore(
+    object = x,          
+    features = Top_200_list,
+    name = "Module_Score"
+  )
+  return(x)
+})
+```
+
+### Save RDS
+```{r}
+#saveRDS(samples.seuratlist, '../outputs/RDS_files/samples/samples.seuratlistMS.rds')
+```
+
+```{r}
+samples.seuratlist <- readRDS('../outputs/RDS_files/samples/samples.seuratlistMS.rds')
+```
+
+## Control1 FeaturePlot
+```{r}
+Idents(samples.seuratlist$control1) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[1]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[1]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$control1@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Control2 FeaturePlot
+```{r}
+Idents(samples.seuratlist$control2) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[2]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[2]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$control2@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Control3 FeaturePlot
+```{r}
+Idents(samples.seuratlist$control3) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[3]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[3]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$control3@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Patient1 FeaturePlot
+```{r}
+Idents(samples.seuratlist$patient1) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[4]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[4]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$patient1@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Patient2 FeaturePlot
+```{r}
+Idents(samples.seuratlist$patient2) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[5]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[5]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$patient2@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Patient3 FeaturePlot
+```{r}
+Idents(samples.seuratlist$patient3) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[7]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[7]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$patient4@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Patient4 FeaturePlot
+```{r}
+Idents(samples.seuratlist$patient4) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratlist[[7]], features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratlist[[7]], features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratlist$patient4@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+# Filter out clusters
+```{r}
+#Create a OSN clusters file
+OSNClusters <- list(
+  "control1" = c(1 ,8 , 23, 27),
+  "control2" = c(5, 3, 11),
+  "control3" = c(13, 14),
+  "patient1" = c(9, 10),
+  "patient2" = c(12, 16, 26),
+  "patient3" = c(10, 21, 22),
+  "patient4" = c(10, 21)
+  )
+
+OSNClusters_df <- enframe(OSNClusters, name = "sample", value = "cluster") %>% unnest(cluster)
+```
+
+## Filter clusters
+```{r}
+samples.seuratlistCL <- 
+  lapply(names(samples.seuratlist), function(x) {
+    seurat_obj <- samples.seuratlist[[x]]
+    #Pull clusters to keep from df
+    keep <- OSNClusters_df %>%
+      filter(sample == x) %>%
+      pull(cluster) %>%
+      as.character()
+    #Filter from 0.6 resolution
+    seurat_obj<- subset(seurat_obj, subset = SCT_snn_res.0.6 %in% keep)
+    
+    return(seurat_obj)
+  }) %>% setNames(names(samples.seuratlist))
+```
+
+## SCTransform
+```{r}
+samples.seuratlistCL <- lapply(samples.seuratlistCL, function(sample){
+    SCTransform(sample, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+})
+```
+
+## Check clustering
+```{r}
+lapply(samples.seuratlistCL, DimPlot)
+```
+
+## Save CL output
+```{r}
+#saveRDS(samples.seuratlistCL, "../outputs/RDS_files/samples/samples.seuratlistCL.rds")
+```
+
+```{r}
+samples.seuratlistCL <- readRDS("../outputs/RDS_files/samples/samples.seuratlistCL.rds")
+```
+
+# Merge all experiments into one seurat object
+```{r}
+samples.seuratmerge <- merge(
+  x = samples.seuratlistCL[[1]], y = c(samples.seuratlistCL[[2]], samples.seuratlistCL[[3]], samples.seuratlistCL[[4]], samples.seuratlistCL[[5]], samples.seuratlistCL[[6]], samples.seuratlistCL[[7]]),
+  merge.data = TRUE,
+  project = "OSN"
+)
+```
+
+## Run SCTransform 
+```{r}
+samples.seuratmerge <- SCTransform(samples.seuratmerge, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+### Save samples.seuratmerge
+```{r}
+saveRDS(samples.seuratmerge, "../outputs/RDS_files/samples/samples.seuratmerge.rds")
+```
+
+```{r}
+samples.seuratmerge <- readRDS("../outputs/RDS_files/samples.seuratmerge.rds")
+```
+
+## Run PCA and UMAP
+```{r}
+## Perform UMAP reduction
+samples.seuratmerge <- RunPCA(samples.seuratmerge)
+samples.seuratmerge <- RunUMAP(samples.seuratmerge, dims = 1:50)
+  
+DimPlot(samples.seuratmerge, reduction = "umap", group.by = "orig.ident")
+FeaturePlot(samples.seuratmerge, features = "STMN1", min.cutoff = 0)
+FeaturePlot(samples.seuratmerge, features = "Module_Score2", min.cutoff = 0)
+```
+
+## Merge control samples and SCTransform
+```{r}
+controls.seuratmerge <- merge(
+  x = samples.seuratlistCL[[1]], y = c(samples.seuratlistCL[[2]], samples.seuratlistCL[[3]]),
+  merge.data = TRUE
+)
+
+controls.seuratmerge <- SCTransform(controls.seuratmerge, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+## Merge patient samples and SCTransform
+```{r}
+patients.seuratmerge <- merge(
+  x = samples.seuratlistCL[[4]], y = c(samples.seuratlistCL[[5]], samples.seuratlistCL[[6]], samples.seuratlistCL[[7]]),
+  merge.data = TRUE,
+  project = "patient"
+)
+
+patients.seuratmerge <- SCTransform(patients.seuratmerge, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+## Controls dimentional reduction
+```{r}
+controls.seuratmerge <- RunPCA(controls.seuratmerge)
+controls.seuratmerge <- RunUMAP(controls.seuratmerge, dims = 1:50)
+  
+DimPlot(controls.seuratmerge, reduction = "umap", group.by = "orig.ident")
+
+FeaturePlot(controls.seuratmerge, features = "TUBB2B", min.cutoff = 0)
+FeaturePlot(controls.seuratmerge, features = "Module_Score1", min.cutoff = 0)
+```
+
+## Patients dimentional reduction
+```{r}
+patients.seuratmerge <- RunPCA(patients.seuratmerge)
+patients.seuratmerge <- RunUMAP(patients.seuratmerge, dims = 1:50)
+
+DimPlot(patients.seuratmerge, reduction = "umap", group.by = "orig.ident")
+
+FeaturePlot(patients.seuratmerge, features = "TUBA1A", min.cutoff = 0)
+FeaturePlot(patients.seuratmerge, features = "Module_Score2", min.cutoff = 0)
+```
+
+# Integration to reduce batch effects
+```{r}
+# Harmony method
+samples.seuratmergeINT <- 
+  IntegrateLayers(object = samples.seuratmerge, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE
+)
+
+# RPCA method (less stringent)
+samples.seuratmergeINT <- 
+  IntegrateLayers(object = samples.seuratmergeINT, method = RPCAIntegration, orig.reduction = "pca", new.reduction = "intergated.rpca", verbose = TRUE, normalization.method = "SCT"
+)
+
+#CCA method (more stringent)
+samples.seuratmergeINT <- 
+  IntegrateLayers(object = samples.seuratmergeINT, method = CCAIntegration, orig.reduction = "pca", new.reduction = "intergated.cca", verbose = TRUE, normalization.method = "SCT"
+)
+```
+
+## Run UMAP
+```{r}
+samples.seuratmergeINT <- RunUMAP(samples.seuratmergeINT, dims = 1:50, reduction = "harmony", reduction.name = "harmony_umap")
+samples.seuratmergeINT <- RunUMAP(samples.seuratmergeINT, dims = 1:50, reduction = "intergated.rpca", reduction.name = "rpca_umap")
+samples.seuratmergeINT <- RunUMAP(samples.seuratmergeINT, dims = 1:50, reduction = "intergated.cca", reduction.name = "cca_umap")
+```
+
+## Plots
+```{r}
+#FeaturePlots
+FeaturePlot(samples.seuratmergeINT, features = c("Module_Score2", "Module_Score1"), reduction = "harmony_umap")
+FeaturePlot(samples.seuratmergeINT, features = c("Module_Score2", "Module_Score1"), reduction = "rpca_umap")
+FeaturePlot(samples.seuratmergeINT, features = c("Module_Score2", "Module_Score1"), reduction = "cca_umap")
+
+#DimPlots
+DimPlot(samples.seuratmergeINT, group.by = "orig.ident", reduction = "harmony_umap", split.by = "orig.ident")
+DimPlot(samples.seuratmergeINT, group.by = "orig.ident", reduction = "rpca_umap", split.by = "orig.ident")
+DimPlot(samples.seuratmergeINT, group.by = "orig.ident", reduction = "cca_umap", split.by = "orig.ident")
+```
+
+### Save Integration RDS
+```{r}
+#saveRDS(samples.seuratmergeINT, "../outputs/RDS_files/samples/samples.seuratmergeINT.rds")
+```
+
+```{r}
+samples.seuratmergeINT <- readRDS("../outputs/RDS_files/samples/samples.seuratmergeINT.rds")
+```
+
+# Re-Cluster
+```{r}
+### Set range of resolutions
+res.range <- seq(0.4, 3, 0.2)
+
+DefaultAssay(samples.seuratmergeINT) <- "SCT"
+samples.seuratmergeINT <- FindNeighbors(samples.seuratmergeINT, dims = 1:50)
+
+for (res in res.range) {
+    samples.seuratmergeINT <- FindClusters(samples.seuratmergeINT, resolution = res)
+}
+
+```
+
+```{r}
+clustree::clustree(samples.seuratmergeINT, prefix = "SCT_snn_res.")
+```
+
+```{r}
+res <- 0.6 #change accordingly
+
+samples.seuratmergeINT <- FindNeighbors(samples.seuratmergeINT, verbose = F)
+samples.seuratmergeINT <- FindClusters(samples.seuratmergeINT, resolution = res, verbose = F)
+
+DimPlot(samples.seuratmergeINT, reduction = "harmony_umap")
+```
+
+```{r}
+Idents(samples.seuratmergeINT) <- "SCT_snn_res.0.6"
+FeaturePlot(samples.seuratmergeINT, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(samples.seuratmergeINT, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+samples.seuratmergeINT@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+# Filter out clusters
+```{r}
+#Create a OSN clusters file
+MSClusters <- c(4, 5, 7, 9, 13, 14, 16, 17)
+```
+
+## Remove patient 3 layer
+```{r}
+DefaultAssay(samples.seuratmergeINT) <- "RNA"
+
+samples.seuratmergeRC <- DietSeurat(
+  samples.seuratmergeINT,
+  assay = 'RNA',
+  layers = c("counts.control1", "counts.control2", "counts.control3", "counts.patient1", "counts.patient2", "counts.patient4", "data.control1", "data.control2", "data.control3", "data.patient1", "data.patient2", "data.patient4")
+)
+
+#Normalise
+samples.seuratmergeRC <- NormalizeData(samples.seuratmergeRC)
+```
+
+## Filter clusters
+```{r}
+samples.seuratmergeRC <- subset(samples.seuratmergeRC, subset = SCT_snn_res.0.6 %in% MSClusters)
+```
+
+## SCTransform
+```{r}
+samples.seuratmergeRC <- SCTransform(samples.seuratmergeRC, method = "glmGamPoi", assay = "RNA",
+            vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+## Perform UMAP reduction
+```{r}
+samples.seuratmergeRC <- RunPCA(samples.seuratmergeRC)
+samples.seuratmergeRC <- RunUMAP(samples.seuratmergeRC, dims = 1:50)
+samples.seuratmergeRC <- RunTSNE(samples.seuratmergeRC, dims = 1:50)
+  
+DimPlot(samples.seuratmergeRC, reduction = "umap", group.by = "orig.ident")
+FeaturePlot(samples.seuratmergeRC, features = "Module_Score1", min.cutoff = 0)
+FeaturePlot(samples.seuratmergeRC, features = "Module_Score2", min.cutoff = 0)
+```
+
+# Integration to reduce batch effects
+```{r}
+# Harmony method
+samples.seuratmergeRC <- 
+  IntegrateLayers(object = samples.seuratmergeRC, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE
+)
+```
+
+## Run UMAP
+```{r}
+samples.seuratmergeRC <- RunUMAP(samples.seuratmergeRC, dims = 1:50, reduction = "harmony", reduction.name = "harmony_umap")
+```
+
+## Plots
+```{r}
+#FeaturePlots
+FeaturePlot(samples.seuratmergeRC, features = c("Module_Score2", "Module_Score1"), reduction = "harmony_umap")
+
+#DimPlots
+DimPlot(samples.seuratmergeRC, group.by = "orig.ident", reduction = "harmony_umap", split.by = "orig.ident", ncol = 2)
+ 
+```
+
+## Save RDS
+```{r}
+#saveRDS(samples.seuratmergeRC, "../outputs/RDS_files/samples/samples.seuratmergeRC.rds")
+```
+
+```{r}
+samples.seuratmergeRC <- readRDS("../outputs/RDS_files/samples/samples.seuratmergeRC.rds")
+```
+
+# Cluster again
+```{r}
+res.range <- seq(0.4, 2.4, 0.2)
+
+DefaultAssay(samples.seuratmergeRC) <- "SCT"
+samples.seuratmergeRC <- FindNeighbors(samples.seuratmergeRC, dims = 1:50)
+
+for (res in res.range) {
+    samples.seuratmergeRC <- FindClusters(samples.seuratmergeRC, resolution = res)
+    U <- DimPlot(samples.seuratmergeRC, reduction = "harmony_umap", label = TRUE) +
+      ggtitle(paste("Resolution:", res))
+    print(U)
+}
+```
+
+```{r}
+res <- 0.8 #change accordingly
+
+samples.seuratmergeC <- FindNeighbors(samples.seuratmergeRC, verbose = F)
+samples.seuratmergeC <- FindClusters(samples.seuratmergeC, resolution = res, verbose = F)
+
+DimPlot(samples.seuratmergeC, reduction = "harmony_umap", label = TRUE)
+```
+
+```{r}
+#saveRDS(samples.seuratmergeC, "../outputs/RDS_files/samples/samples.seuratmergeC.rds")
+```
+
+```{r}
+samples.seuratmergeC <- readRDS("../outputs/RDS_files/samples/samples.seuratmergeC.rds")
+```
+
+## Expression of genes in the Axon initial segment
+```{r}
+FeaturePlot(samples.seuratmergeC, features = c("ANK3", "SPTBN4", "SCN8A", "NFASC", "KCNQ2", "NRCAM"), reduction = "harmony_umap", label = TRUE)
+
+FeaturePlot(samples.seuratmergeC, features = c("ANK1", "ANK2", "ANK3"), reduction = "harmony_umap", label = TRUE)
+
+FeaturePlot(samples.seuratmergeC, features = c("SPTBN1", "SPTBN4"), reduction = "harmony_umap", label = TRUE)
+```
+
+```{r}
+FeaturePlot(samples.seuratmergeC, features = c("Module_Score1", "Module_Score2"), reduction = "harmony_umap")
+```
+
+##Convert H5AD file to Seurat
+```{r}
+extractH5ad <- function(h5ad, save.rds = FALSE, rds.path = NULL, verbose = TRUE) {
+  # Check mandatory input
+  if(verbose){.outputMsg("Checking input parameters.")}
+  if (missing(h5ad)) {
+      .outputMsg("Provide valid h5ad fileor url.", type = 'abort')
+    stop()
+  }
+  temp_file <- NULL
+  # Check if 'h5ad' is a URL
+  if (grepl("^http[s]?://", h5ad)) {
+    # Download the file
+    if (verbose) {.outputMsg(paste("Downloading h5ad file from: ", h5ad))}
+    tmp_file <- tempfile(fileext = ".h5ad")
+    curl::curl_download(h5ad, destfile = tmp_file, quiet = !verbose)
+    h5ad <- tmp_file
+    on.exit({
+      if (!is.null(temp_file) && file.exists(temp_file)) {
+        file.remove(temp_file)
+      }
+    }, add = TRUE)
+  }
+  # Ensure that the 'anndata' Python package is installed and available
+  anndata <- reticulate::import("anndata")
+  # Read the h5ad file
+  adata <- anndata$read_h5ad(h5ad)
+  features <- unlist(adata$var_names$to_list())
+  cells <- unlist(adata$obs_names$to_list())
+  # Extracting elements in h5ad file
+  # Normalised counts
+  if (verbose) {.outputMsg("Inspecting h5ad file.")}
+  if (is.null(adata$X)) {
+    .outputMsg("No expression data found in file.", type = 'abort')
+    stop()
+  } else {
+    .outputMsg("Normalised counts found.")
+    norm.cnt <- as(t(as.matrix(adata$X)), "dgCMatrix")
+    rownames(norm.cnt) <- features  # Setting row names
+    colnames(norm.cnt) <- cells  # Setting column names
+  }
+  # Raw counts
+  if (!is.null(adata$raw)) {
+    .outputMsg("Raw counts found.")
+    raw.cnt <- as(t(as.matrix(adata$raw$X)), "dgCMatrix")
+    rownames(raw.cnt) <- features  # Setting row names
+    colnames(raw.cnt) <- cells  # Setting column names
+    if (!is.integer(raw.cnt)) {
+      .outputMsg("Raw counts appear to be of float type.", type = 'warn')
+    }
+  } else {
+    .outputMsg("No raw counts found.", type = 'warn')
+    raw.cnt <- NULL
+  }
+  # Metadata
+  if (!is.null(adata$obs)) {
+    .outputMsg("Metadata found.")
+    metadata <- adata$obs
+  } else {
+    .outputMsg("Metadata not found.", type = 'warn')
+    metadata <- NULL
+  }
+  # Embeddings
+  if (!is.null(adata$obsm)) {
+    embeddings_names <- strsplit(sub(".*: ", "", adata$obsm), ", ")[[1]]
+    if (length(embeddings_names) > 0) {
+      .outputMsg(paste("The following embeddings were found:", paste(embeddings_names, collapse = ", ")))
+    }
+  } else {
+    .outputMsg("No embeddings found.", type = 'warn')
+  }
+  # Creating Seurat Objects
+  if (!is.null(raw.cnt)) {
+    if (!is.null(metadata)) {
+      .outputMsg("Creating Seurat object using raw counts and metadata extracted.")
+      seurat.obj <- Seurat::CreateSeuratObject(raw.cnt, assay = "RNA", meta.data = metadata)
+    } else {
+      .outputMsg("Creating Seurat object using raw counts extracted.")
+      seurat.obj <- Seurat::CreateSeuratObject(raw.cnt, assay = "RNA")
+    }
+  } else {
+    if (!is.null(metadata)) {
+      .outputMsg("Creating Seurat object using normalised counts and metadata extracted.", type = 'warn')
+      seurat.obj <- Seurat::CreateSeuratObject(norm.cnt, assay = "RNA", meta.data = metadata)
+    } else {
+      .outputMsg("Creating Seurat object using normalised counts extracted.", type = 'warn')
+      seurat.obj <- Seurat::CreateSeuratObject(norm.cnt, assay = "RNA")
+    }
+  }
+  # Appending normalised counts
+  seurat.obj <- Seurat::SetAssayData(object = seurat.obj, slot = "data", new.data = norm.cnt)
+  # Appending Embeddings
+  if (length(embeddings_names) > 0) {
+    for (emb in embeddings_names) {
+      dimred.df <- adata$obsm[[emb]]
+      dimred <- str_remove(emb, "X_")
+      if (!is.null(dimred.df)) {
+        rownames(dimred.df) <- cells
+        colnames(dimred.df) <- paste0(dimred, "_", seq_len(ncol(dimred.df)))
+        # Save embedding into the Seurat object
+        seurat.obj[[dimred]] <- Seurat::CreateDimReducObject(embeddings = dimred.df, key = paste0(dimred, "_"), assay = Seurat::DefaultAssay(seurat.obj))
+        .outputMsg(paste("Saved embedding:", dimred))
+      }
+    }
+  }
+  # Save as RDS file if specified
+  if (save.rds && !is.null(rds.path)) {
+    saveRDS(seurat.obj, file = rds.path)
+    .outputMsg(paste(rds.path, "file successfully created."))
+  }
+  # Return the Seurat object
+  return(seurat.obj)
+}
+# output messages
+.outputMsg <- function(text, type = 'info'){
+    warnorng <- crayon::make_style('darkgoldenrod3')
+    abortred <- crayon::make_style('red3')
+    infogreen <- crayon::make_style('darkolivegreen4')
+    if(type == 'warn'){
+        rlang::inform(warnorng(stringr::str_glue(cli::symbol$warning, ' ', text)))
+    } else if(type == 'abort'){
+        rlang::inform(abortred(stringr::str_glue(cli::symbol$cross, ' ', text)))
+    } else {
+        rlang::inform(infogreen(stringr::str_glue(cli::symbol$pointer, ' ', text)))
+    }
+}
+```
+
+```{r}
+#' ## Converting H5AD file to Seurat object
+refneurons.obj <- extractH5ad("originals/WHB-10Xv3-Neurons-raw.h5ad")
+#refneurons.obj <- extractH5ad("https://allen-brain-cell-atlas.s3-us-west-2.amazonaws.com/expression_matrices/WHB-10Xv3/20240330/WHB-10Xv3-Neurons-raw.h5ad")
+#'
+#' @returns A Seurat object with all the elements found in the H5AD file.
+#' @export
+```
+
+# Import Ref
+```{r}
+seurat.refV1C <- readRDS("../originals/seurat_ref_V1C.rds")
+```
+
+```{r}
+DimPlot(seurat.refV1C, reduction = "UMAP", group.by = "supercluster_term", label = TRUE)
+head(seurat.refV1C)
+```
+
+```{r}
+mart = useMart("ensembl")
+mart <- useMart(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+us_mart <- useEnsembl(biomart = "ensembl",dataset="hsapiens_gene_ensembl", mirror = "useast")
+```
+
+```{r}
+View(listAttributes(us_mart))
+
+id_name <- getBM(c("ensembl_gene_id", "external_gene_name"), mart = us_mart)
+```
+
+## Filter vector for genes in seurat.refV1C
+```{r}
+rownames(seurat.refV1C)
+
+in_ref <- id_name[id_name$ensembl_gene_id %in% rownames(seurat.refV1C), ]
+
+in_ref <- distinct(in_ref, ensembl_gene_id, .keep_all = TRUE)
+```
+
+## Order in terms of layout in seurat
+```{r}
+# Keep gene id if gene name is blank
+in_ref$external_gene_name[in_ref$external_gene_name == ""] <- in_ref$ensembl_gene_id[in_ref$external_gene_name == ""]
+
+```
+
+```{r}
+#Extract counts matrix
+counts_matrix <- GetAssayData(seurat.refV1C, layer = "counts")
+
+# Check for genes in counts_matrix but not in in_ref
+missing_genes_in_ref <- setdiff(rownames(counts_matrix), in_ref$ensembl_gene_id)
+
+# Number of missing genes
+length(missing_genes_in_ref) 
+
+# Check which missing genes are in the Seurat object
+missing_genes_in_seurat <- missing_genes_in_ref[missing_genes_in_ref %in% rownames(seurat.refV1C)]
+
+# Subset the counts_matrix for missing genes that are not in id_name
+missing_gene_counts <- counts_matrix[missing_genes_in_ref, , drop = FALSE]
+
+# Sum counts across all cells for each missing gene
+gene_sums <- rowSums(missing_gene_counts)
+```
+
+```{r}
+#Add genes found in counts matrix into in_ref
+missing_df <- data.frame(ensembl_gene_id = missing_genes_in_seurat, external_gene_name = missing_genes_in_seurat)
+
+in_ref <- rbind(in_ref, missing_df)
+
+in_ref <- in_ref[order(match(in_ref$ensembl_gene_id, rownames(seurat.refV1C))), ]
+```
+
+## Collapse into new seurat.obj
+```{r}
+#ref_counts   <- aggregate(counts_matrix[in_ref$ensembl_gene_id, ], list(in_ref$external_gene_name), sum)
+
+#Aggregate counts by gene names
+ref_counts <- rowsum(counts_matrix[in_ref$ensembl_gene_id, ], in_ref$external_gene_name)
+```  
+
+## Create new seurat object
+```{r}
+ref.seurat <- CreateSeuratObject(counts = ref_counts,
+                   meta.data = seurat.refV1C@meta.data)
+```
+## Get umap and tsne
+```{r}
+umap_embeddings <- Embeddings(seurat.refV1C, reduction = "UMAP")
+tsne_embeddings <- Embeddings(seurat.refV1C, reduction = "tSNE")
+
+ref.seurat[["umap"]] <- CreateDimReducObject(embeddings = umap_embeddings, key = "UMAP_")
+ref.seurat[["tsne"]] <- CreateDimReducObject(embeddings = tsne_embeddings, key = "tSNE_")
+```
+### Save ref
+```{r}
+#saveRDS(ref.seurat, "../outputs/RDS_files/ref.seurat.rds")
+```
+
+```{r}
+ref.seurat <- readRDS("../outputs/RDS_files/ref.seurat.rds")
+```
+
+# Filter out non neuronal clusters
+```{r}
+ref.seurat <- subset(ref.seurat, subset = cell_type == "neuron")
+DimPlot(ref.seurat, reduction = "umap", group.by = "cell_type")
+```
+
+## SCTransform and pca
+```{r}
+cc.genes <- cc.genes.updated.2019 #contains human cell cycle genes
+```
+
+```{r}
+ref.seurat <- NormalizeData(ref.seurat)
+ref.seurat <- CellCycleScoring(ref.seurat, 
+                     s.features = cc.genes$s.genes, 
+                     g2m.features = cc.genes$g2m.genes, 
+                     set.ident = FALSE)
+```
+
+```{r}
+options(future.globals.maxSize = 6 * 1024^3)  # Increase memory limit to  6GB to account for large data set
+ref.seurat <- SCTransform(ref.seurat, method = "glmGamPoi", assay = "RNA",
+            vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+```{r}
+ref.seurat <- RunPCA(ref.seurat)
+ref.seurat <- RunTSNE(ref.seurat, dims = 1:50, reduction.name = "sct_tsne") 
+ref.seurat <- RunUMAP(ref.seurat, dims = 1:50, reduction.name = "sct_umap")
+```
+
+### Save ref
+```{r}
+#saveRDS(ref.seurat, "../outputs/RDS_files/ref.seurat2.rds")
+```
+
+```{r}
+ref.seurat <- readRDS("../outputs/RDS_files/ref.seurat2.rds")
+```
+
+## Import AIS genes for samples
+```{r}
+AIS <- read.csv("../originals/AIS_genes.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS$Expressed <- AIS$Symbol %in% rownames(samples.seuratmergeC[["SCT"]])
+
+#Remove False rows
+AIS_filtered <- AIS %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS_filtered <- AIS_filtered %>% distinct(Symbol, .keep_all = TRUE) %>% pull(Symbol)
+```
+
+```{r}
+AIS2 <- read.csv("../originals/AIS2.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS2$Expressed <- AIS2$Gene.product %in% rownames(samples.seuratmergeC[["SCT"]])
+
+#Remove False rows
+AIS2_filtered <- AIS2 %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS2_filtered <- AIS2_filtered %>% distinct(Gene.product, .keep_all = TRUE) %>% pull(Gene.product)
+```
+
+```{r}
+AIS_genes_samples <- unique(c(AIS_filtered, AIS2_filtered))
+```
+
+#Import AIS genes for ref
+```{r}
+AIS <- read.csv("../originals/AIS_genes.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS$Expressed <- AIS$Symbol %in% rownames(ref.seurat[["SCT"]])
+
+#Remove False rows
+AIS_filtered <- AIS %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS_filtered <- AIS_filtered %>% distinct(Symbol, .keep_all = TRUE) %>% pull(Symbol)
+```
+
+```{r}
+AIS2 <- read.csv("../originals/AIS2.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS2$Expressed <- AIS2$Gene.product %in% rownames(ref.seurat[["SCT"]])
+
+#Remove False rows
+AIS2_filtered <- AIS2 %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS2_filtered <- AIS2_filtered %>% distinct(Gene.product, .keep_all = TRUE) %>% pull(Gene.product)
+```
+
+```{r}
+AIS_genes_ref <- unique(c(AIS_filtered, AIS2_filtered))
+```
+
+```{r}
+AIS_genes <- unique(c(AIS_genes_ref, AIS_genes_samples))
+```
+
+# Add column for iOSN and mOSN labels
+```{r}
+samples.seuratmergeC@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+
+iOSN <- c(1, 4, 5)
+mOSN <- c(0, 2, 6, 7)
+iOSN_mOSN <- 3
+
+samples.seuratmergeC@meta.data$label <- 
+  ifelse(samples.seuratmergeC$seurat_clusters %in% iOSN, "iOSN",
+  ifelse(samples.seuratmergeC$seurat_clusters %in% mOSN, "mOSN",
+  ifelse(samples.seuratmergeC$seurat_clusters %in% iOSN_mOSN, "iOSN/mOSN", "NA")))
+
+DimPlot(samples.seuratmergeC, reduction = "harmony_umap", group.by = "label")
+DimPlot(samples.seuratmergeC, reduction = "harmony_umap", label = TRUE)
+FeaturePlot(samples.seuratmergeC, features = c("Module_Score1", "Module_Score2"), reduction = "harmony_umap")
+```
+
+```{r}
+samples.seuratmergeC <- readRDS("../outputs/RDS_files/samples/samples.seuratmergeC.rds")
+```
+
+## Subset to remove one cell
+```{r}
+samples.seurat <- subset(samples.seuratmergeC, cells = colnames(samples.seuratmergeC@assays$SCT@data))
+```
+
+```{r}
+#saveRDS(samples.seurat, "../outputs/RDS_files/samples/samples.seurat.rds")
+```
+
+```{r}
+samples.seurat <- readRDS("../outputs/RDS_files/samples/samples.seurat.rds")
+```
+
+##Merge layers
+```{r}
+samples.seurat <- JoinLayers(samples.seurat, assay = "RNA")
+```
+
+# Merge samples and ref
+```{r}
+samples.seurat@assays$SCT <- NULL
+ref.seurat@assays$SCT <- NULL
+
+DefaultAssay(samples.seurat) <- "RNA"
+DefaultAssay(ref.seurat) <- "RNA"
+
+sampleref.seurat <- merge(
+  x = ref.seurat, y = samples.seurat,
+  merge.data = TRUE,
+  project = "AIS"
+)
+```
+
+```{r}
+#saveRDS(sampleref.seurat, "../outputs/RDS_files/samples/sampleref.seurat.rds")
+```
+
+```{r}
+sampleref.seurat <- readRDS("../outputs/RDS_files/samples/sampleref.seurat.rds")
+```
+
+## SCT again
+```{r}
+sampleref.seurat <- NormalizeData(sampleref.seurat)
+
+options(future.globals.maxSize = 6 * 1024^3)  # Increase memory limit to  6GB to account for large data set
+sampleref.seurat <- SCTransform(sampleref.seurat, method = "glmGamPoi", assay = "RNA",
+            vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+## Add pca
+```{r}
+sampleref.seurat <- RunPCA(sampleref.seurat)
+```
+
+## Add metadata variable for grouping
+```{r}
+sampleref.seurat@meta.data$cell_class <- ifelse(
+  is.na(sampleref.seurat$label), sampleref.seurat$supercluster_term,
+  ifelse(is.na(sampleref.seurat$supercluster_term), sampleref.seurat$label, NA)
+)
+```
+
+```{r}
+#saveRDS(sampleref.seurat, "../outputs/RDS_files/samples/sampleref.seuratSCT.rds")
+```
+
+```{r}
+sampleref.seurat <- readRDS("../outputs/RDS_files/samples/sampleref.seuratSCT.rds")
+```
+
+## Split objects for features?
+```{r}
+sample.list <- SplitObject(sampleref.seurat, split.by = "orig.ident")
+```
+
+## Remove genes not in the SCT slots of seurat objects
+```{r}
+AIS_genes_ref <- readRDS("../outputs/RDS_files/AIS_genes_ref.rds")
+AIS_genes_samples <- readRDS("../outputs/RDS_files/AIS_genes_sample.rds")
+AIS_genes <- readRDS("../outputs/RDS_files/AIS_genes.rds")
+
+missing_ref <- setdiff(AIS_genes, AIS_genes_ref)
+missing_samples <- setdiff(AIS_genes, AIS_genes_samples)
+
+AISG <- intersect(intersect(AIS_genes, AIS_genes_ref), AIS_genes_samples)
+```
+
+#Find integration anchors with RNA
+```{r}
+sample.list <- lapply(sample.list, function(sample) {
+  DefaultAssay(sample) <- "RNA"
+  return(sample)
+})
+
+sample.list <- lapply(sample.list, function(sample) {
+  sample <- NormalizeData(sample)
+  sample <- subset(sample, features = AISG)
+  sample <- ScaleData(sample)
+  return(sample)
+})
+
+#run pca
+sample.list <- lapply(X = sample.list, FUN = RunPCA, features = AISG)
+
+#Check RNA slot
+lapply(sample.list, function(sample) {
+   AISG[which(!AISG %in% rownames(sample@assays$RNA))]
+})
+
+OSN.anchors <- FindIntegrationAnchors(sample.list, anchor.features = AISG, reduction = "cca", assay = NULL, dims = 1:50)
+OSN.combined <- IntegrateData(anchorset = OSN.anchors, k.weight = 40)
+```
+
+##Run pca and umap
+```{r}
+OSN.anchors <- readRDS("../outputs/RDS_files/samples/OSN.anchors_june.rds")
+OSN.combinedRNA <- readRDS("../outputs/RDS_files/samples/OSN.combined_june.rds")
+```
+
+```{r}
+DefaultAssay(OSN.combinedRNA) <- "integrated"
+
+OSN.combinedRNA <- ScaleData(OSN.combinedRNA)
+
+OSN.combinedRNA <- RunPCA(OSN.combinedRNA , assay = "integrated")
+OSN.combinedRNA <- RunUMAP(OSN.combinedRNA , assay = "integrated", reduction = "pca",  dims = 1:50)
+```
+
+```{r}
+DimPlot(OSN.combinedRNA, reduction = "umap", group.by = "cell_class", label = TRUE)
+```
+# Extract data matrix for integrated
+```{r}
+matrix <- OSN.combinedRNA@assays[["integrated"]]@data
+
+AIS_genes_ref <- readRDS("../outputs/RDS_files/AIS_genes_ref.rds")
+AIS_genes_samples <- readRDS("../outputs/RDS_files/AIS_genes_sample.rds")
+AIS_genes <- readRDS("../outputs/RDS_files/AIS_genes.rds")
+ref.seurat <- readRDS("../outputs/RDS_files/ref.seurat2.rds")
+
+missing_genes <- setdiff(AIS_genes, rownames(OSN.combinedRNA))
+missing_genes <- intersect(missing_genes, rownames(ref.seurat))
+missing_genes2 <- intersect(missing_genes, rownames(samples.seurat)) # genes are not in AIS_specific list so not added
+```
+
+## Create and combine 0 matrix with integrated data slot
+```{r}
+mat <- matrix(0, length(missing_genes), ncol(matrix))
+rownames(mat) <- missing_genes
+colnames(mat) <- colnames(matrix)
+
+#get reference expression values
+ref.mat <- as.matrix(ref.seurat@assays$RNA@layers$data)
+colnames(ref.mat) <- colnames(ref.seurat)
+rownames(ref.mat) <- rownames(ref.seurat@assays$RNA@features)
+
+mat[,colnames(ref.seurat)] <- ref.mat[rownames(mat),]
+
+#rbind to rest of matrix
+feature_matrix <- rbind(mat, matrix)
+
+feature_matrix[1:5,1:5]
+#transpose
+feature_matrix <- t(feature_matrix)
+#scale
+feature_matrix <- scale(feature_matrix)
+```
+
+```{r}
+sampleref.seurat <- readRDS("../outputs/RDS_files/samples/sampleref.seuratSCT.rds")
+```
+
+#Get mean expression levels 
+```{r}
+features <- data.frame(feature_matrix, cell_class = sampleref.seurat@meta.data$cell_class)
+
+features <- features %>%
+  group_by(cell_class) %>%
+  summarise(across(everything(), mean))
+```
+
+## Remove splatter and miscellenous
+```{r}
+# remove rows 7 and 8 
+features <- features[-c(7, 8), ]
+```
+
+## Group cell_class
+```{r}
+features$cell_class_group <- with(features, ifelse(
+  features$cell_class %in% c("CGE interneuron", "MGE interneuron", "LAMP5-LHX6 and Chandelier"), "GABAergic",
+  ifelse(features$cell_class %in% c("Upper-layer intratelencephalic", "Deep-layer intratelencephalic", "Deep-layer near-projecting", "Deep-layer corticothalamic and 6b"), "GLUTamatergic",
+         ifelse(features$cell_class == "iOSN", "iOSN",
+                ifelse(features$cell_class == "mOSN", "mOSN",
+                       ifelse(features$cell_class == "iOSN/mOSN", "iOSN/mOSN", "other"
+                              ))))))
+
+unique(features$cell_class_group)
+
+#remove cell_class
+features <- subset(features, select = -c(cell_class))
+
+features <- features %>%
+  group_by(cell_class_group) %>%
+  summarise(across(everything(), mean))
+
+#change cell_class_group to rownames
+features <- features %>% column_to_rownames(var = "cell_class_group")
+```
+
+##Subset list for specific AIS genes and remove mOSN row
+```{r}
+AIS_specific <- read.csv("../originals/AIS_specific.csv", header = TRUE)
+
+#subset list
+features_mat <- features[, colnames(features) %in% AIS_specific$Genes]
+
+#remove mOSN and re label iOSN/mOSN as mOSN
+features_mat <- features_mat[!rownames(features_mat) == "mOSN",]
+rownames(features_mat)[rownames(features_mat) == "iOSN/mOSN"] = "mOSN"
+```
+
+```{r}
+dists <- as.matrix(features_mat)
+heatmap(dists, scale = "none", )
+
+library(pheatmap)
+pheatmap <- pheatmap(dists, scale = "none")
+pheatmap
+```
+
+## Cutree with 2 clusters
+```{r}
+cutree2 <- cutree(pheatmap$tree_col, k = 2)
+
+cutree2_df <- as.data.frame(cutree2)
+clusters2 <- list()
+
+for (i in 1:2) {
+  clusters2[[i]] <- rownames(cutree2_df)[cutree2_df$cutree == i]
+}
+
+clusters2
+```
+
+## Plot boxplot for each cluster
+```{r}
+features_df <- rownames_to_column(features_mat, var = "cell_class_group")
+
+features_df <- pivot_longer(features_df,
+                            cols = where(is.numeric),  
+                            names_to = "Genes", 
+                            values_to = "Expression")
+
+
+#plot boxplots for 2
+boxplots <- lapply(1:2, function(cluster) {
+  features_df %>%
+    filter(Genes %in% clusters2[[cluster]]) %>%
+    ggplot(aes(x = cell_class_group, y = Expression, fill = cell_class_group)) +
+    geom_boxplot() +
+    theme_minimal() +
+    scale_fill_brewer(palette = "RdYlBu") +  
+    labs(y = "Scaled Expression", x = "Cell Type", title = paste("Gene Cluster", cluster))
+})
+```
+
+# Gene Ontology
+```{r}
+AIS_specific <- read.csv("../originals/AIS_specific.csv")
+
+GO <- lapply(clusters2, function(cluster) {
+AIS_go <- enrichGO(gene = cluster,
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = AIS_specific$Genes,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+return(AIS_go)
+  })
+```
+
+```{r}
+results <- lapply(GO, function(x) {
+  cluster <- x@result  
+  cluster <- cluster[order(cluster$p.adjust),]
+  cluster <- cluster[order(cluster$qvalue),]
+  cluster <- cluster[order(cluster$pvalue),]
+  #cluster <- cluster[order(-cluster$FoldEnrichment), ]
+  return(cluster) 
+})
+
+```
+
+```{r}
+# Filter for top 10 terms
+results_filtered <- lapply(results, function(x){
+  x[1:10,]})
+```
+
+###Plot
+```{r}
+plot_function <- function(df, title) {
+  ggplot(df, aes(x = zScore, y = reorder(Description, zScore), fill = -log10(pvalue))) +  
+    geom_bar(stat = "identity", width = 0.5) +  
+    scale_fill_gradient(low = "blue", high = "red") +  
+    theme_minimal() +
+    labs(x = "zScore", y = "Term", title = title, fill = "-log10(pvalue)") +
+    theme(
+      axis.text.y = element_text(size = 10, colour = "black"),
+      axis.text.x = element_text(size = 12, colour = "black"),
+      axis.title = element_text(size = 14, colour = "black"),
+      plot.title = element_text(size = 16, face = "bold")
+    )
+}
+
+Go_plots <- lapply(seq_along(results_filtered), function(i) {
+  plot_function(results_filtered[[i]], paste("Enriched Gene Cluster", i))
+})
+```
+
+#Gene ontology with categories
+```{r}
+AIS_specific <- read.csv("../originals/AIS_genes_Sheet1.csv", header = TRUE)
+```
+
+```{r}
+all_categories <- unique(AIS_specific$Category)
+all_categories[4] <- "Enzyme"
+
+all_genes <- unique(AIS_specific$Genes)
+all_genes <-as.data.frame(all_genes)
+
+background <- as.data.frame(sapply(all_categories, function(cat) {
+  genes_in_cat <- AIS_specific$Genes[AIS_specific$Category == cat]
+  part_of <- length(genes_in_cat)
+  not_in_cat <- AIS_specific$Genes[AIS_specific$Category != cat]
+  not_part_of <- length(not_in_cat)
+  return(c("Part of" = part_of, "Not part of" = not_part_of))
+}))
+
+```
+
+```{r}
+cluster_summary <- list()
+
+cluster_summary <- lapply(clusters2, function(cluster_genes) {
+  summary <- as.data.frame(sapply(all_categories, function(cat) {
+    genes_in_cat <- AIS_specific$Genes[AIS_specific$Category == cat]
+    part_of <- sum(genes_in_cat %in% cluster_genes)
+    genes_not_in_cat <- AIS_specific$Genes[AIS_specific$Category != cat]
+    not_part_of <- sum(genes_not_in_cat %in% cluster_genes)
+    return(c("Part of" = part_of, "Not part of" = not_part_of))
+  }))
+  return(summary)
+})
+```
+
+## Fisher's exact test
+```{r}
+Fisher <- lapply(cluster_summary, function(x) {
+  x <- t(x)
+  back <- t(background)
+  colnames(back) <- c("bg_part", "bg_not_part")
+  test <- as.data.frame(cbind(x, back))
+  return(test)
+})
+```
+
+```{r}
+Fishers_test <- lapply(Fisher, function(df){
+  out <- bind_rows(apply(df, 1, function(line){
+     dat <- matrix(line, nrow =2, byrow = T)
+      fisher.out <- fisher.test(dat)
+      data.frame(pvalue = fisher.out$p.value,
+                 estimate = fisher.out$estimate)
+  }))
+  rownames(out) <- rownames(df)
+  out
+})
+```
+
+```{r}
+names(Fishers_test) <- paste0("Gene Cluster", seq_along(Fishers_test))
+
+long_df <- bind_rows(
+  lapply(names(Fishers_test), function(cluster) {
+    df <- Fishers_test[[cluster]]
+    df$category <- rownames(df) 
+    df$cluster <- cluster
+    return(df)
+  })
+)
+
+category_dotplot <- ggplot(long_df, aes(x = cluster, y = category)) +
+  geom_point(aes(size = estimate, fill = -log10(pvalue)),
+    shape = 21, stroke = 0.5) +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  labs(x = "Gene Cluster", y = "Category", colour = "P-value", size = "Estimate")
+```
+
+#Run PCA on OSNcombined
+```{r}
+OSN.combinedRNA <- readRDS("../outputs/RDS_files/samples/OSN.combined_june.rds")
+sampleref.seurat <- readRDS("../outputs/RDS_files/samples/sampleref.seuratSCT.rds")
+
+DefaultAssay(OSN.combinedRNA) <- "integrated"
+
+OSN.combinedRNA <- ScaleData(OSN.combinedRNA)
+
+OSN.combinedRNA <- RunPCA(OSN.combinedRNA , assay = "integrated")
+OSN.combinedRNA <- RunUMAP(OSN.combinedRNA , assay = "integrated", reduction = "pca",  dims = 1:50)
+```
+
+```{r}
+DimPlot(OSN.combinedRNA, reduction = "umap", group.by = "cell_class", label = TRUE)
+```
+
+## Transfer cell embeddings
+```{r}
+pcamat <- OSN.combinedRNA@reductions[["pca"]]@cell.embeddings
+umapmat <- OSN.combinedRNA@reductions[["umap"]]@cell.embeddings
+
+#check rownames
+rownames(pcamat)
+rownames(sampleref.seurat@reductions[["pca"]]@cell.embeddings)
+
+#reorder as to current seurat object
+pcamat1 <- pcamat[order(match(rownames(pcamat), (rownames(sampleref.seurat@reductions$pca@cell.embeddings)))), ]
+
+#check
+sum(rownames(pcamat1) == rownames(sampleref.seurat@reductions$pca@cell.embeddings), TRUE)
+length(rownames(pcamat1))
+length(rownames(sampleref.seurat@reductions$pca@cell.embeddings))
+
+sum(rownames(pcamat) == rownames(umapmat), TRUE)
+
+sum(rownames(sampleref.seurat@reductions$pca@cell.embeddings) == colnames(sampleref.seurat), TRUE)
+#Reorder umap
+umapmat1 <- umapmat[order(match(rownames(umapmat), (rownames(sampleref.seurat@reductions$pca@cell.embeddings)))), ]
+
+
+sampleref.seurat[["integrated.pca"]] <- CreateDimReducObject(embeddings = pcamat1, key = "IntegratedPC_")
+sampleref.seurat[["integrated.umap"]] <- CreateDimReducObject(embeddings = umapmat1, key = "IntegratedUMAP_")
+```
+
+```{r}
+DimPlot(sampleref.seurat, reduction = "integrated.umap", group.by = "cell_class", label = TRUE)
+```
+
+## Remove splatter and miscellenous
+```{r}
+# Identify cells that are not "Splatter" or "Miscellaneous"
+cells_to_keep <- which(!sampleref.seurat$cell_class %in% c("Splatter", "Miscellaneous", "mOSN"))
+
+# Subset the Seurat object
+sampleref.seurat <- sampleref.seurat[, cells_to_keep]
+
+sampleref.seurat$cell_class[sampleref.seurat$cell_class == "iOSN/mOSN"] <- "mOSN"
+
+DimPlot(sampleref.seurat, reduction = "integrated.umap", group.by = "cell_class")
+```
+
+## Group cell_class
+```{r}
+sampleref.seurat@meta.data$cell_class_group <- with(sampleref.seurat@meta.data, ifelse(
+  cell_class %in% c("CGE interneuron", "MGE interneuron", "LAMP5-LHX6 and Chandelier"), "GABAergic",
+  ifelse(cell_class %in% c("Upper-layer intratelencephalic", "Deep-layer intratelencephalic", "Deep-layer near-projecting", "Deep-layer corticothalamic and 6b"), "GLUTamatergic",
+         ifelse(cell_class == "iOSN", "iOSN",
+                ifelse(cell_class == "mOSN", "mOSN", "other"
+                       )))))
+```
+
+```{r}
+DimPlot(sampleref.seurat, reduction = "integrated.umap", group.by = "cell_class_group", label = TRUE)
+```
+
+#Remove mOSNs from samples
+```{r}
+samples.seurat <- readRDS("../outputs/RDS_files/samples/samples.seurat.rds")
+```
+
+```{r}
+#Subset with umap
+cells_to_keep <- colnames(samples.seurat)[Embeddings(samples.seurat, "harmony_umap")[, "harmonyumap_1"] > 0]
+samples.seurat <- subset(samples.seurat, cells = cells_to_keep)
+```
+
+```{r}
+# Add column for iOSN and mOSN labels
+samples.seurat@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+
+iOSN <- c(5, 4, 1)
+mOSN <- c(2, 0, 3)
+
+samples.seurat@meta.data$label <- 
+  ifelse(samples.seurat$seurat_clusters %in% iOSN, "iOSN",
+  ifelse(samples.seurat$seurat_clusters %in% mOSN, "mOSN", "NA"))
+```
+
+```{r}
+samples.seurat <- NormalizeData(samples.seurat)
+
+options(future.globals.maxSize = 6 * 1024^3)  # Increase memory limit to  6GB to account for large data set
+samples.seurat <- SCTransform(samples.seurat, method = "glmGamPoi", assay = "RNA",
+            vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+```{r}
+samples.seurat <- 
+  IntegrateLayers(object = samples.seurat, method = HarmonyIntegration, orig.reduction = "harmony", new.reduction = "harmony_int", verbose = FALSE)
+```
+
+```{r}
+samples.seurat <- RunUMAP(samples.seurat, dims = 1:50, reduction = "harmony_int", reduction.name = "harmony_int_umap")
+DimPlot(samples.seurat, reduction = "harmony_int_umap", label = TRUE)
+```
+
+```{r}
+# Re-Cluster
+### Set range of resolutions
+res.range <- seq(0.4, 3, 0.2)
+
+DefaultAssay(samples.seurat) <- "SCT"
+samples.seurat <- FindNeighbors(samples.seurat, dims = 1:50)
+
+for (res in res.range) {
+    samples.seurat <- FindClusters(samples.seurat, resolution = res)
+}
+```
+
+```{r}
+clustree::clustree(samples.seurat, prefix = "SCT_snn_res.", )
+```
+
+```{r}
+res <- 0.6 
+
+samples.seurat <- FindNeighbors(samples.seurat, verbose = F)
+samples.seurat <- FindClusters(samples.seurat, resolution = res, verbose = F)
+```
+
+```{r}
+DimPlot(samples.seurat, reduction = "harmony_int_umap", group.by = "label")
+FeaturePlot(samples.seurat, features = c("Module_Score1", "Module_Score2"), reduction = "harmony_int_umap", label = TRUE)
+
+samples.seurat@meta.data %>%
+  group_by(SCT_snn_res.0.6) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+
+```
+
+```{r}
+#saveRDS(samples.seurat, "../outputs/RDS_files/samples/samples.seurat_clean_june.rds")
+```
+
+```{r}
+samples.seurat <- readRDS("../outputs/RDS_files/samples/samples.seurat_clean_june.rds")
+```
+
+```{r}
+OSN_plot <- DimPlot(samples.seurat, reduction = "harmony_int_umap", group.by = "label")
+OSN_plot + labs(title =  'OSN clusters')
+
+FeaturePlot(samples.seurat, reduction = "harmony_int_umap", features = "Module_Score2")
+FeaturePlot(samples.seurat, reduction = "harmony_int_umap", features = "Module_Score1")
+OSN_ident <- DimPlot(samples.seurat, reduction = "harmony_int_umap", group.by = "orig.ident")
+
+OSN_ident + scale_color_discrete(labels = c("control1", "control2", "control3",
+                                    "control4", "control5", "control6")) 
+```
+
+#Pseudo time
+##Create DiffMap
+```{r}
+data <- as.matrix(samples.seurat@reductions$harmony_int@cell.embeddings)
+
+dm <- DiffusionMap(data, n_pcs = 3, n_eigs = 2)
+```
+
+```{r}
+samples.seurat[["diffmap"]] <- CreateDimReducObject(embeddings = dm@eigenvectors[,1:2], key = "dc_", assay = "SCT")
+
+DimPlot(samples.seurat, reduction = "diffmap", group.by = 'label') + labs(title = "DiffusionMap")
+
+```
+
+##Apply slignshot
+```{r}
+sds <- slingshot(Embeddings(samples.seurat, "diffmap"), 
+                 clusterLabels = samples.seurat$seurat_clusters,
+                 start.clus= '4')
+slingLineages(sds)
+
+#saveRDS(sds, "../outputs/RDS_files/sds_human_june.rds")
+```
+
+##Calculate average pseudotime
+```{r}
+sds <- readRDS("../outputs/RDS_files/pseudotime/sds_human_june.rds")
+samples.seurat$pseudotime <- slingAvgPseudotime(sds)
+
+FeaturePlot(samples.seurat, "pseudotime", reduction = "harmony_int_umap", label = TRUE)
+
+FeatureScatter(samples.seurat, feature1 = "pseudotime", feature2 = "STMN1") + geom_smooth()
+FeatureScatter(samples.seurat, feature1 = "pseudotime", feature2 = "ANK3") + geom_smooth()
+```
+
+```{r}
+#saveRDS(samples.seurat, "../outputs/RDS_files/samples/samples.seuratpseudotime_june.rds")
+```
+
+```{r}
+samples.seurat <- readRDS("../outputs/RDS_files/samples/samples.seuratpseudotime_june.rds")
+```
+
+## Calculate proportions of cells 
+```{r}
+meta <- samples.seurat@meta.data
+meta$bins <- cut(samples.seurat$pseudotime, breaks = 10, include.lowest = TRUE)
+
+meta$bin_label <- factor(meta$bins, labels = paste0("Bin ", seq_len(nlevels(meta$bins))))
+
+prop <- meta %>% 
+  group_by(label, bin_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(bin_label) %>% 
+  mutate(proportion = (n / sum(n))*100)
+```
+
+```{r}
+ggplot(prop, aes(x = bin_label, y = proportion, colour = label)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(x = "Pseudotime Bins", y = "Proportion of cells", colour = "Label")
+```
+
+##Pseudo-ranking
+```{r}
+samples.seurat$pseudorank <- (rank(samples.seurat$pseudotime)*10)/696
+
+metarank <- samples.seurat@meta.data
+metarank$bins <- cut(samples.seurat$pseudorank, breaks = 10, include.lowest = TRUE)
+
+metarank$bin_label <- factor(metarank$bins, labels = paste0("Bin ", seq_len(nlevels(meta$bins))))
+
+prop_rank <- metarank %>% 
+  group_by(label, bin_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(bin_label) %>% 
+  mutate(proportion = (n / sum(n))*100)
+
+ggplot(prop_rank, aes(x = bin_label, y = proportion, colour = label)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(x = "Pseudo-rank Bins", y = "Proportion of cells", colour = "Label")
+```
+
+##Plot densities
+```{r}
+pseudotime_density <- ggplot(meta, aes(x = pseudotime, fill = label, colour = label)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(x = "Pseudotime", y = "Density", fill = "Label", colour = "Label")
+
+pseudorank_density <- ggplot(metarank, aes(x = pseudorank, fill = label, colour = label)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(x = "Pseudorank", y = "Density", fill = "Label", colour = "Label")
+```
+
+```{r}
+#saveRDS(samples.seurat, "../outputs/RDS_files/samples/samples.seuratpseudorank_june.rds")
+samples.seurat <- readRDS("../outputs/RDS_files/samples/samples.seuratpseudorank_june.rds")
+```
+
+# tradeSeq
+```{r}
+## identify a distinct type of de pattern along a lineage
+weights <- slingCurveWeights(sds)
+weights <- rowMaxs(weights)
+counts <- as.matrix(samples.seurat@assays$SCT$counts)
+
+#saveRDS(weights, "../Rstudio/scripts/weights.rds")
+#saveRDS(counts, "../Rstudio/scripts/counts.rds")
+```
+
+##fitGAM
+```{r}
+#analyse relationship between gene expression and pseudotime using fitGAM
+sce <- fitGAM(counts = counts, 
+              pseudotime = samples.seurat[["pseudorank"]], 
+              cellWeights = weights)
+```
+
+```{r}
+#saveRDS(sce, "../outputs/RDS_files/pseudotime/sce_fitgam.rds")
+```
+
+## startVsEndTest
+```{r}
+sce <- readRDS("../outputs/RDS_files/pseudotime/sce_june.rds")
+startRes <- startVsEndTest(sce)
+```
+
+###Check for AIS genes
+```{r}
+AIS_MG <- read.csv("../originals/Matt_AIS_list.csv")
+AIS_MG <- unique(AIS_MG)
+
+AIS_MG$human_gene <- NA
+out <- gprofiler2::gorth(AIS_MG$Genes,
+        source_organism = "mmusculus",
+        target_organism = "hsapiens")
+AIS_MG$human_gene[out$input_number] <- out$ortholog_name
+
+res <- rownames(startRes)
+check_MG <- unique(AIS_MG$human_gene)
+
+AIS_MG_check <- intersect(res, check_MG)
+
+startRes %>% filter(res %in% AIS_MG_check) %>% filter(pvalue < 0.05)
+```
+### Filter list
+```{r}
+sr_sd <- sd(startRes$waldStat)
+
+quant <- quantile(startRes$waldStat, 0.975)
+
+startRes_filtered <- startRes %>%
+  filter(pvalue < 0.05) %>%
+  filter(waldStat > quant) %>%
+  arrange(desc(logFClineage1))
+
+#Top 10 top differentially expressed genes
+#startRes %>% 
+#  filter(pvalue < 0.05) %>% 
+#  filter(waldStat > quant) %>%
+#  slice_max(logFClineage1, n = 10)
+```
+
+```{r}
+Idents(samples.seurat) <- "label"
+FeatureScatter(samples.seurat, "pseudorank", "JAKMIP1") +geom_smooth() 
+FeatureScatter(samples.seurat, "pseudotime", "CD47") +geom_smooth()
+```
+
+```{r}
+up <- startRes_filtered %>% filter(startRes_filtered$logFClineage1 > 0.5)
+
+down <- startRes_filtered %>% filter(startRes_filtered$logFClineage1 < -0.5)
+```
+
+###Check how many are significant and are up and down regulated
+```{r}
+startRes_filtered %>% filter(rownames(startRes_filtered) %in% AIS_MG_check)
+
+up %>% filter(rownames(up) %in% AIS_MG_check)
+
+down %>% filter(rownames(down) %in% AIS_MG_check)
+```
+
+```{r}
+Idents(samples.seurat) <- "label"
+FeatureScatter(samples.seurat, "pseudorank", "FGF12") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "MAP7D2") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "MAPRE3") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "EPB41") + geom_smooth()
+
+FeatureScatter(samples.seurat, "pseudorank", "SCN9A") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "SCN3B") + geom_smooth()
+```
+
+###Gene Ontology
+```{r}
+library(clusterProfiler)
+#BiocManager::install("org.Hs.eg.db")
+
+universe <- rownames(samples.seurat)
+
+up_go <- enrichGO(gene = rownames(up),
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = universe,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+down_go <- enrichGO(gene = rownames(down),
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = universe,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+```
+
+###RVGO
+```{r}
+up_results <- up_go@result
+
+simMatrix <- calculateSimMatrix(up_results$ID,
+                                orgdb="org.Hs.eg.db",
+                                ont="BP",
+                                method="Rel")
+
+scores <- setNames(-log10(up_results$p.adjust), up_results$ID)
+
+rvgo_up <- reduceSimMatrix(simMatrix, scores, threshold = 0.7, orgdb = "org.Hs.eg.db")
+```
+
+```{r}
+rvgo_up_filtered <- rvgo_up <- rvgo_up %>% filter(go == parent)
+```
+
+```{r}
+down_results <- down_go@result
+simMatrix_down <- calculateSimMatrix(down_results$ID,
+                                orgdb="org.Hs.eg.db",
+                                ont="BP",
+                                method="Rel")
+
+scores_down <- setNames(-log10(down_results$p.adjust), down_results$ID)
+
+rvgo_down <- reduceSimMatrix(simMatrix_down, scores_down, threshold = 0.7, orgdb = "org.Hs.eg.db")
+```
+
+```{r}
+rvgo_down_filtered <- rvgo_down %>% filter(go == parent)
+```
+
+```{r}
+plot_function <- function(df, title) {
+  ggplot(df, aes(x = score, y = reorder(term, score), fill = score)) +  
+    geom_bar(stat = "identity", width = 0.5) +  
+    scale_fill_gradient(low = "blue", high = "red") +  
+    theme_minimal() +
+    labs(x = "Score", y = "Term", title = title, fill = "Score") +
+    theme(
+      axis.text.y = element_text(size = 12, color = "black"),  # Bigger and darker terms
+      axis.text.x = element_text(size = 12, color = "black"),
+      axis.title = element_text(size = 14, color = "black"),
+      plot.title = element_text(size = 16, face = "bold", color = "black")
+    )
+}
+
+plot_function_log <- function(df, title) {
+  ggplot(df, aes(x = log10(score), y = reorder(term, score), fill = score)) +  
+    geom_bar(stat = "identity") +  
+    scale_fill_gradient(low = "blue", high = "red") +
+    theme_minimal() +
+    labs(x = "log10(Score)", y = "Term", title = title, fill = "Score") +
+    theme(
+      axis.text.y = element_text(size = 12, color = "black"),  # Bigger and darker terms
+      axis.text.x = element_text(size = 12, color = "black"),
+      axis.title = element_text(size = 14, color = "black"),
+      plot.title = element_text(size = 16, face = "bold", color = "black")
+    )
+}
+
+plot_function(rvgo_up_filtered[c(1:8, 10, 12),], paste("Enriched Cluster Up Regulated"))
+plot_function_log(rvgo_down_filtered[c(1:9, 12),],paste("Enriched Cluster Down Regulated"))
+```
+##Associations test
+```{r}
+associationRes <- associationTest(sce)
+associationRes <- na.omit(associationRes)
+
+sd <- sd(associationRes$waldStat)
+quant_2 <- quantile(associationRes$waldStat, 0.925)
+
+association_filtered <- associationRes %>% 
+  filter(pvalue < 0.05) %>%
+  filter(waldStat > quant_2) %>%
+  arrange(desc(meanLogFC))
+  #slice_min(meanLogFC, n = 10)
+```
+
+```{r}
+up_association <- rownames(association_filtered)[association_filtered$meanLogFC > 0.5]
+
+startRes_fold <- startRes %>%
+  filter(logFClineage1 < 0.2) %>%
+  filter(logFClineage1 > -0.2)
+
+intersect <- intersect(up_association, rownames(startRes_fold))
+
+down_association <- rownames(association_filtered)[association_filtered$meanLogFC < -0.5]
+```
+
+```{r}
+association_filtered[rownames(association_filtered) %in% intersect,]
+Idents(samples.seurat) <- "label"
+FeatureScatter(samples.seurat, "pseudorank", "BPIFB1") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "CNTRL") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "KTN1") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "RDX") + geom_smooth()
+FeatureScatter(samples.seurat, "pseudorank", "AC092667.1") + geom_smooth()
+```
+
+## tradeseq with mice
+```{r}
+mice_sample <- readRDS("../outputs/RDS_files/pseudotime/obj_harmony.rds")
+mice_sce <- readRDS("../outputs/RDS_files/pseudotime/sce_mice.rds")
+```
+
+```{r}
+data_mice <- as.matrix(mice_sample@reductions$harmony@cell.embeddings)
+
+dm <- DiffusionMap(data_mice, n_pcs = 3)
+```
+
+```{r}
+mice_sample[["diffmap"]] <- CreateDimReducObject(embeddings = dm@eigenvectors[,1:3], key = "dc_", assay = "SCT")
+
+DimPlot(mice_sample, reduction = "diffmap", label = TRUE) 
+```
+
+```{r}
+sds_mice <- slingshot(Embeddings(mice_sample, "diffmap"), 
+                 clusterLabels = mice_sample$seurat_clusters,
+                 start.clus= '13')
+slingLineages(sds_mice)
+```
+
+```{r}
+#add pseudotime for all 4 lineages
+mice_sample@meta.data <- cbind(mice_sample@meta.data, slingPseudotime(sds_mice, na = FALSE))
+#add averaged
+mice_sample$pseudotime <- slingAvgPseudotime(sds_mice)
+
+FeaturePlot(mice_sample, "pseudotime", reduction = "harmony", label = TRUE)
+```
+
+##startvsend test with averaged pseudotime
+```{r}
+startRes_mice <- startVsEndTest(mice_sce)
+
+quant2 <- quantile(startRes_mice$waldStat, 0.975)
+
+startRes_filtered_mice <- startRes_mice %>%
+  filter(pvalue < 0.05) %>%
+  filter(waldStat > quant2) %>%
+  arrange(desc(logFClineage1))
+
+up_mice <- rownames(startRes_filtered_mice)[startRes_filtered_mice$logFClineage1 > 0.5]
+
+down_mice <- rownames(startRes_filtered_mice)[startRes_filtered_mice$logFClineage1 < -0.5]
+
+mice_sve <- c(as.data.frame(up_mice), as.data.frame(down_mice))
+
+startRes_filtered_mice %>%
+  filter(logFClineage1 < 0.5) %>%
+  filter(logFClineage1 > -0.5)
+
+AIS_MG <- read.csv("../originals/Matt_AIS_list.csv")
+AIS_MG <- unique(AIS_MG$Genes)
+
+res <- rownames(startRes_filtered_mice)
+check_MG <- unique(AIS_MG)
+
+AIS_MG_check <- intersect(res, check_MG)
+
+startRes_filtered_mice %>% filter(res %in% AIS_MG_check) %>% filter(pvalue < 0.05)
+```
+
+###Compare genes in mice and human
+```{r}
+up_mice <- as.data.frame(up_mice)
+colnames(up_mice)[colnames(up_mice) == "up_mice"] <- "gene"
+
+up_convert <- gprofiler2::gorth(up_mice$gene,
+                         source_organism = "mmusculus",
+                         target_organism = "hsapiens")
+
+down_mice <- as.data.frame(down_mice)
+colnames(down_mice)[colnames(down_mice) == "down_mice"] <- "gene"
+
+down_convert <- gprofiler2::gorth(down_mice$gene,
+                         source_organism = "mmusculus",
+                         target_organism = "hsapiens")
+
+up_common <- intersect(up, up_convert$ortholog_name)
+down_common <- intersect(down, down_convert$ortholog_name)
+
+up_unique <- setdiff(up, up_convert$ortholog_name)
+up_convert_unique <- setdiff(up_convert$ortholog_name, up)
+```
+
+##Association test with mice
+```{r}
+associationRes_mice <- associationTest(mice_sce)
+associationRes_mice <- na.omit(associationRes_mice)
+
+sd <- sd(associationRes_mice$waldStat)
+quant_2 <- quantile(associationRes_mice$waldStat, 0.925)
+
+association_filtered_mice <- associationRes_mice %>% 
+  filter(pvalue < 0.05) %>%
+  filter(waldStat > quant_2) %>%
+  arrange(desc(meanLogFC))
+  #slice_min(meanLogFC, n = 10)
+```
+
+```{r}
+up_2 <- rownames(association_filtered_mice)[association_filtered_mice$meanLogFC > 0.5]
+
+startRes_fold <- startRes_mice %>%
+  filter(logFClineage1 < 0.2) %>%
+  filter(logFClineage1 > -0.2)
+
+intersect <- intersect(up_2, rownames(startRes_fold))
+
+down_2 <- rownames(association_filtered_mice)[association_filtered_mice$meanLogFC < -0.5]
+```
+
+```{r}
+asso_intersect <- association_filtered_mice[rownames(association_filtered_mice) %in% intersect,]
+
+res <- rownames(asso_intersect)
+check_MG <- unique(AIS_MG)
+
+AIS_MG_check <- intersect(res, check_MG)
+
+asso_intersect %>% filter(res %in% AIS_MG_check) %>% filter(pvalue < 0.05)
+```
+
+```{r}
+FeatureScatter(mice_sample, "pseudotime", "Gng3") + geom_smooth()
+FeatureScatter(mice_sample, "pseudotime", "Casp6") + geom_smooth()
+FeatureScatter(mice_sample, "pseudotime", "Eif1") + geom_smooth()
+```
+
+##subset for 5000 cells
+```{r}
+set.seed(123)
+cells_to_keep <- sample(colnames(mice_sample), 5000)
+
+mice_sample_subset <- subset(mice_sample, cells = cells_to_keep)
+
+#sds_subset <- slingshot(Embeddings(mice_sample_subset, "diffmap"), 
+                 #clusterLabels = mice_sample_subset$seurat_clusters,
+                 #start.clus= '13')
+#slingLineages(sds_subset)
+```
+
+```{r}
+## identify a distinct type of de pattern along a lineage
+weights <- slingCurveWeights(sds_mice)
+#weights <- rowMaxs(weights)
+cellWeights <- weights[cells_to_keep, , drop = FALSE]
+counts <- as.matrix(mice_sample_subset@assays$SCT$counts)
+
+#saveRDS(cellWeights, "../Rstudio/cellWeights.rds")
+#saveRDS(counts, "../Rstudio/counts.rds")
+#saveRDS(sds_mice, "../Rstudio/sds_mice.rds")
+#saveRDS(mice_sample_subset, "../Rstudio/mice_sample_subset.rds")
+```
+
+```{r}
+#analyse relationship between gene expression and pseudotime using fitGAM
+sce_mice_subset <- fitGAM(counts = counts, 
+              pseudotime = slingPseudotime(sds_mice, na = FALSE)[colnames(mice_sample_subset),],
+              cellWeights = cellWeights)
+```
+
+```{r}
+sce_mice_subset <- readRDS("../outputs/RDS_files/pseudotime/sce_mice_subset.rds")
+counts <- readRDS("../outputs/RDS_files/pseudotime/counts.rds")
+```
+
+##diffend test for lineage comparisons
+```{r}
+endRes <- diffEndTest(sce_mice_subset, pairwise = TRUE)
+```
+### filter for significance in entire list 
+```{r}
+endRes <- na.omit(endRes)
+quantile_end <- quantile(endRes$waldStat, 0.975)
+quantile(endRes$waldStat_1vs2, 0.975)
+
+endRes_filtered <- endRes %>%
+  filter(pvalue < 0.05) %>%
+  filter(waldStat > quantile_end) %>%
+  arrange(desc(waldStat))
+
+intersect(AIS_MG, toupper(rownames(endRes_filtered)))
+```
+
+```{r}
+plotSmoothers(sce_mice_subset, counts, "Ubb")
+```
+
+#Differential Expression between Patients vs Healthy
+```{r}
+metadata_disease <- data.frame(
+  Path = c("../originals/Disease/Covid_1",
+           "../originals/Disease/Covid_2_sample1",
+           "../originals/Disease/Covid_2_sample2",
+           "../originals/Disease/Covid_3",
+           "../originals/Disease/Covid_4",
+           "../originals/Disease/Covid_5",
+           "../originals/Disease/Covid_6",
+           "../originals/Disease/Presbyosmic_1",
+           "../originals/Disease/Presbyosmic_2",
+           "../originals/Disease/Presbyosmic_3"),
+  ID = c("Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_3", "Covid_4", "Covid_5", "Covid_6", "Presbyosmic_1", "Presbyosmic_2", "Presbyosmic_3")
+)
+
+
+write.csv(metadata_disease, "../metadata/metadata_disease.csv", row.names = FALSE, quote = FALSE)
+```
+
+##Create seurat objects in a list 
+```{r}
+disease.meta <- read.csv("../metadata/metadata_disease.csv")
+
+## check if all paths are present
+all(file.exists(disease.meta$Path))
+
+disease.seuratlist <- apply(disease.meta, 1, function(line) {
+  disease.data <- Read10X(line[["Path"]])
+  
+  #Create Seurat object
+  disease.seurat <- CreateSeuratObject(counts = disease.data,
+                                      project = line[["ID"]],
+                                      min.features = 5)
+  disease.seurat$experiment <- "RNA"
+  
+  # Adding additional metadata
+  disease.seurat@meta.data <- mutate(disease.seurat@meta.data, !!!line)
+  
+  disease.seurat
+})
+
+names(disease.seuratlist) <- disease.meta$ID
+
+disease.seuratlist
+```
+##QC metrics
+### Calculate percent mitochondria
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    #calculates % of mitochondrial genes in RNA assay of each sample
+    sample$percent_mito <- PercentageFeatureSet(sample, pattern = "^MT-",assay = "RNA") 
+    #set identity class?
+    Idents(sample) <- "experiment"
+    sample
+})
+```
+
+### Find no of value of mitochondrial % under 20%
+```{r}
+sapply(disease.seuratlist[1:10], function(x) sum(x@meta.data$percent_mito < 20, na.rm = TRUE))
+```
+### Plot mitochondria % distribution per experiment
+```{r}
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", layer = "counts") +
+        ggtitle(sample$orig.ident[1]) +
+        scale_y_continuous(limits = c(0,65))
+})
+```
+
+### Annotate doublets using scDblFinder
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    #Extract count matrix from each sample to identify potential doublets
+    sce <- scDblFinder(GetAssayData(sample, assay = "RNA", layer = "counts"))
+    #Store results in metadata of seurat object
+    sample$scDblFinder.class <- sce$scDblFinder.class
+    sample
+})
+```
+
+### Calculate percent ribosomal
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    #calculates % of ribosomal genes in RNA assay for each sample
+    #^RP[SL] - ribosomal protein Small/Large subunit
+    sample$percent_ribo <- PercentageFeatureSet(sample, pattern = "^RP[SL]",assay = "RNA")
+    Idents(sample) <- "experiment"
+    sample
+})
+```
+
+### Plot ribosome % distribution per experiment
+```{r}
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "percent_ribo", group.by = "experiment", layer = "counts") +
+        ggtitle(sample$orig.ident[1]) +
+        scale_y_continuous(limits = c(0,65))
+})
+```
+
+### Quantify cell cycle phase
+```{r}
+### run cell cycle scoring
+cc.genes <- cc.genes.updated.2019 #contains human cell cycle genes
+```
+
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+	sample <- NormalizeData(sample)
+    CellCycleScoring(sample, 
+                     s.features = cc.genes$s.genes, 
+                     g2m.features = cc.genes$g2m.genes, 
+                     set.ident = FALSE)
+})
+```
+
+```{r}
+lapply(disease.seuratlist, function(sample){
+    sample@meta.data %>% 
+        ggplot(aes(x=Phase, fill = Phase)) + 
+        geom_bar() +
+        theme_minimal() +
+        scale_fill_brewer(palette = "Set2") +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+### Run SCTransform and regress out CC-score
+```{r}
+options(future.globals.maxSize = 2 * 1024^3)  # Increase memory limit to 2 GB to account for large data set
+
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    SCTransform(sample, method = "glmGamPoi", 
+    		vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)#regresses out effect of cell cycle scores (s and G2M phases)
+})
+
+# Helps prevent clustering based on cell cycle differences rather than biological differences
+```
+
+```{r}
+#saveRDS(disease.seuratlist, "../outputs/RDS_files/disease.seuratlist.rds")
+```
+
+```{r}
+disease.seuratlist <- readRDS("../outputs/RDS_files/disease/disease.seuratlist.rds")
+```
+
+### Filter out poor quality cells
+```{r}
+### check number of cells before qc
+ncell_before.v <- lapply(disease.seuratlist, ncol)
+unlist(ncell_before.v)
+```
+### 1st qc pass using median absolute deviation from the median
+```{r}
+qc.df <- do.call(rbind,lapply(disease.seuratlist, function(sample){
+    # feature cut off for 3 MADS below the median (cells few than this threshold = low quality)
+    feature.cutoff <- median(sample@meta.data$nFeature_SCT) - 3*mad(sample@meta.data$nFeature_SCT) 
+    #avoids removing too many cells so threshold cuts at 100 genes
+    feature.cutoff <- ifelse(feature.cutoff < 100, 100, feature.cutoff)
+    #Mito cut off for 3 MADS above the median. (cells high in mito% = dying or stressed)
+    mito.cutoff <- median(sample@meta.data$percent_mito) + 3*mad(sample@meta.data$percent_mito)
+    #Ensure mito does not exceed 10%
+    mito.cutoff <- ifelse(mito.cutoff > 10, 10, mito.cutoff)
+    return(data.frame(feature.cutoff = feature.cutoff,
+                      mito.cutoff = mito.cutoff))
+}))
+```
+
+```{r}
+disease.seuratlist.filt <- lapply(disease.seuratlist, function(sample) {
+    sample.id <- as.character(sample$orig.ident[1])
+    subset(sample, 
+           subset = nFeature_RNA > qc.df[sample.id,]$feature.cutoff & percent_mito < qc.df[sample.id,]$mito.cutoff)
+})
+```
+
+### Check metric distribution
+```{r}
+lapply(disease.seuratlist.filt, function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+```{r}
+lapply(disease.seuratlist.filt, function(sample){
+    VlnPlot(sample, "nFeature_RNA", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+### Overwrite
+```{r}
+disease.seuratlist <- disease.seuratlist.filt
+```
+
+## Briefly normalize, scale, get variable features, and pca
+```{r}
+options(future.globals.maxSize = 2 * 1024^3) 
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    SCTransform(sample, method = "glmGamPoi", verbose = FALSE) 
+})
+```
+
+## 2nd qc pass: remove low quality clusters
+### Briefly cluster cells using higher resolution
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+	sample <- RunPCA(sample)
+    sample <- FindNeighbors(sample, dims = 1:50) # constructs knn graph using first 50 PCs
+    sample <- FindClusters(sample, resolution = 1.8) # Louvin clustering algorithm (High res)
+    sample
+})
+```
+
+## Check distribution of mito% and nFeature for control 1-3
+```{r}
+# Percent mito
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "percent_mito") +
+        ggtitle(sample$orig.ident[1]) 
+})
+
+# Features
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "nFeature_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+##First round of removing cluster
+```{r}
+#Remove clusters with concomitantly low features (<1000) or high mito % (>2.5)
+
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    clusters <- sample@meta.data %>% 
+        group_by(seurat_clusters) %>% 
+        summarise(maxfeat = max(nFeature_RNA), 
+                  maxmito = max(percent_mito)) %>% 
+        filter(maxfeat >1000 | maxmito < 2.5) %>% 
+        pull(seurat_clusters)
+    subset(sample, idents = clusters)
+})
+```
+
+### check distribution again
+```{r}
+# Percent mito
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "percent_mito") +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+##Second round of removing cluster
+```{r}
+#Remove clusters with concomitantly low features (<2000) or low RNA count (<4000)
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    clusters <- sample@meta.data %>% 
+        group_by(seurat_clusters) %>% 
+        summarise(maxfeat = max(nFeature_RNA), 
+                  maxcount = max(nCount_RNA)) %>% 
+        filter(maxfeat >2000 | maxcount > 4000) %>% 
+        pull(seurat_clusters)
+    subset(sample, idents = clusters)
+})
+```
+
+##Check distribution again
+```{r}
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "nCount_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+}) 
+
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "nFeature_RNA") +
+        ggtitle(sample$orig.ident[1]) 
+}) 
+```
+
+## Final SCTransform
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+    SCTransform(sample, method = "glmGamPoi", 
+    		vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+})
+```
+
+```{r}
+#saveRDS(disease.seuratlist, "../outputs/RDS_files/disease.seuratlistSCT.rds")
+```
+
+```{r}
+disease.seuratlist <- readRDS("../outputs/RDS_files/disease/disease.seuratlistSCT.rds")
+```
+
+```{r}
+unlist(lapply(disease.seuratlist, ncol))
+```
+
+## Merge Covid samples 1 and 2
+```{r}
+covid2 <- merge(x = disease.seuratlist[[2]], y = disease.seuratlist[[3]], merge.data = TRUE,
+  project = "Covid_2")
+
+#SCTransform
+covid2 <- SCTransform(covid2, method = "glmGamPoi", vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+
+disease.seuratlist[["Covid_2"]] <- covid2
+
+disease.seuratlist <- disease.seuratlist[!(names(disease.seuratlist) %in% c("Covid_2_sample1", "Covid_2_sample2"))]
+```
+
+##Dimensional Reduction
+```{r}
+## Perform UMAP reduction
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+	sample <- RunPCA(sample) #Standard PC for complex systems default 50
+	sample <- RunTSNE(sample, dims = 1:50) #Standard for complex systems
+    sample <- RunUMAP(sample, dims = 1:50)
+    sample 
+})
+```
+
+```{r}
+## Check metric distribution
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "percent_mito", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+```{r}
+lapply(disease.seuratlist, function(sample){
+    VlnPlot(sample, "nFeature_RNA", group.by = "experiment", pt.size = 0) +
+        ggtitle(sample$orig.ident[1]) 
+})
+```
+
+```{r}
+DimPlot(disease.seuratlist[[9]], reduction = 'umap', group.by = 'orig.ident')
+DimPlot(disease.seuratlist[[9]], reduction = 'pca', group.by = 'orig.ident') 
+##Not integrating as batch effects are not present
+```
+
+##Cell clustering
+### Determine the best clustering resolution
+```{r}
+### Set range of resolutions
+res.range <- seq(0.4, 3, 0.2)
+
+disease.seuratlist <- lapply(disease.seuratlist, function(obj){
+    DefaultAssay(obj) <- "SCT"
+    obj <- FindNeighbors(obj, dims = 1:50)
+    for(res in res.range){
+        obj <- FindClusters(obj, resolution = res)
+    }
+    obj
+})
+```
+
+### Plot clustree for each sample
+```{r}
+lapply(disease.seuratlist, function(dat){
+    clustree::clustree(dat, prefix = "SCT_snn_res.")   
+}) 
+```
+
+## Calculate weighted sum of squares for each experiment
+```{r}
+#This is another method of identifying the optimal clustering resolution.
+wss.all <- do.call(bind_rows,lapply(disease.seuratlist, function(sample){
+  wss.out <- do.call(bind_rows, lapply(res.range, function(k){
+
+    # get centroid per cluster
+    centroids <- aggregate(Embeddings(sample, reduction = "pca"),
+          sample[[paste0("SCT_snn_res.", k)]], 
+          mean) %>% 
+    column_to_rownames(paste0("SCT_snn_res.", k))
+    diffsq <- (Embeddings(sample, reduction = "pca") - 
+        centroids[sample@meta.data[[paste0("SCT_snn_res.", k)]],])^2
+    sdsq <- colSds(Embeddings(sample, reduction = "pca"))^2
+    wdiff <- diffsq/sdsq
+    
+    wss <- sum(sqrt(rowSums(wdiff)))
+    data.frame(clust=k, wss = wss)
+ }))
+  
+  wss.out %>% 
+    mutate(id = sample$orig.ident[1])
+}))
+```
+
+### Plot out WSS vs resolution
+```{r}
+wss.all %>% 
+  group_by(id) %>% 
+  mutate(scaled_wss = scale(wss)) %>% 
+  ggplot(aes(x=clust,y=scaled_wss,group=id, colour=id)) +
+  geom_line()
+
+#Graph should sort of plateau down to an elbow at 0.6/0.8 (to be similar to clustree), but instead roughly shows between 1 and 2.
+```
+
+## Cluster for real
+```{r}
+res <- 0.8 #change accordingly
+disease.seuratlist <- lapply(disease.seuratlist, function(sample){
+	sample <- FindNeighbors(sample, verbose = F)
+    sample <- FindClusters(sample, resolution = res, verbose = F)
+})
+```
+
+```{r}
+lapply(disease.seuratlist, DimPlot)
+DimPlot(disease.seuratlist[[9]], reduction = 'umap', group.by = 'orig.ident')
+```
+
+## Checking for gene expression from gene list 
+```{r}
+library(readr)
+human_genes <- read_csv("../originals/Human_genes.csv")
+
+#Change Immature neurons to iOSN
+human_genes <- human_genes %>% mutate(cluster = ifelse(cluster == "Immature Neurons", "iOSN", cluster))
+
+#Change Mature neurons to mOSN
+human_genes <- human_genes %>% mutate(cluster = ifelse(cluster == "Mature Neurons", "mOSN", cluster))
+
+#Split dataframe
+human_genes_split <- split(human_genes, ~cluster)
+```
+
+##Import Mouse genes
+```{r}
+mouse_genes <- read_csv("../originals/Mouse_genes.csv")
+#Split 
+mouse_genes_split <- split(mouse_genes, ~cluster)
+```
+
+##Convert mouse genes into human
+```{r}
+mouse_genes_split <- lapply(mouse_genes_split, function(df) {
+  df$human_gene <- NA
+   out <- gprofiler2::gorth(df$gene,
+        source_organism = "mmusculus",
+        target_organism = "hsapiens"   #change target_organism accordingly
+   )
+   df$human_gene[out$input_number] <- out$ortholog_name
+   df
+})
+```
+
+##Remove NAs in Mouse_genes_split
+```{r}
+mouse_genes_split <- bind_rows(mouse_genes_split)
+
+#Remove NAs
+mouse_genes_split <- mouse_genes_split %>% filter(!is.na(human_gene))
+```
+
+## Add human_gene column to match mouse_gene_split
+```{r}
+human_genes_split <- bind_rows(human_genes_split)
+
+human_genes_split$human_gene <- human_genes_split$gene
+```
+
+##Combine the df
+```{r}
+combine <- rbind(human_genes_split, mouse_genes_split)
+```
+
+##Find distinct genes
+```{r}
+distinct_genes <- combine %>% distinct(human_gene, .keep_all = TRUE)
+```
+
+##Sort by logFC
+```{r}
+sort_logFC <- distinct_genes[order(-distinct_genes$avg_logFC),]
+```
+
+##Do all samples express the gene?
+```{r}
+#Replicate human_gene column from sort_logFC 
+all_genes <- data.frame(human_gene = sort_logFC$human_gene)
+
+#Create separate data frame to see if samples contain genes
+in_dataset_df <- bind_cols(setNames(lapply(disease.seuratlist, function(x){
+  sort_logFC$human_gene %in% rownames(x[["SCT"]])
+}), sapply(disease.seuratlist, Project)))
+  
+#Filter for true all 7
+filtered_sort_logFC <- sort_logFC[rowSums(in_dataset_df) == 9,]
+
+#Filter for 100 genes each cluster
+Top_200 <- filtered_sort_logFC %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_logFC, n = 100)
+```
+
+```{r}
+Top_200 <- split(Top_200, ~cluster) #A list of 2 data frames
+
+#For module scoring
+Top_200_list <- lapply(Top_200, function(df) df$human_gene)
+
+#add marker genes from paper
+Top_200_list$iOSN <- c(Top_200_list$iOSN, "GAP43", "DCX", "GNG8")
+Top_200_list$mOSN <- c(Top_200_list$mOSN, "GNG13")
+```
+
+## Generate module scores
+```{r}
+disease.seuratlist <- lapply(disease.seuratlist, function(x) {
+  x <- AddModuleScore(
+    object = x,          
+    features = Top_200_list,
+    name = "Module_Score"
+  )
+  return(x)
+})
+```
+
+```{r}
+lapply(disease.seuratlist, function(x){
+  FeaturePlot(x, features = "Module_Score1", reduction = 'umap', label = TRUE
+              )})
+```
+
+```{r}
+lapply(disease.seuratlist, function(x){
+  FeaturePlot(x, features = "Module_Score2", reduction = 'umap', label = TRUE
+              )})
+```
+
+```{r}
+#saveRDS(disease.seuratlist, "../outputs/RDS_files/disease/disease.seuratlistMS.rds")
+#saveRDS(disease.seuratlist, "../outputs/RDS_files/disease/disease.seuratlistMS2.rds") ##With markers from paper
+```
+
+```{r}
+disease.seuratlist <- readRDS("../outputs/RDS_files/disease/disease.seuratlistMS2.rds")
+```
+
+## Covid1
+```{r}
+Idents(disease.seuratlist$Covid_1) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Covid_1, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Covid_1, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Covid_1@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Covid2
+```{r}
+Idents(disease.seuratlist$Covid_2) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Covid_2, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Covid_2, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Covid_2@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Covid3
+```{r}
+Idents(disease.seuratlist$Covid_3) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Covid_3, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Covid_3, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Covid_3@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Covid4
+```{r}
+Idents(disease.seuratlist$Covid_4) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Covid_4, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Covid_4, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Covid_4@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Covid5
+```{r}
+Idents(disease.seuratlist$Covid_5) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Covid_5, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Covid_5, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Covid_5@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Covid6
+```{r}
+Idents(disease.seuratlist$Covid_6) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Covid_6, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Covid_6, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Covid_6@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+
+## Presymbyosmic 1
+```{r}
+  Idents(disease.seuratlist$Presbyosmic_1) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Presbyosmic_1, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Presbyosmic_1, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Presbyosmic_1@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Presbyosmic_2
+```{r}
+Idents(disease.seuratlist$Presbyosmic_2) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Presbyosmic_2, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Presbyosmic_2, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Presbyosmic_2@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Presbyosmic_3
+```{r}
+Idents(disease.seuratlist$Presbyosmic_3) <- "SCT_snn_res.0.8"
+FeaturePlot(disease.seuratlist$Presbyosmic_3, features = "Module_Score1", label = TRUE,
+            min.cutoff = 0)
+FeaturePlot(disease.seuratlist$Presbyosmic_3, features = "Module_Score2", label = TRUE,
+            min.cutoff = 0)
+
+disease.seuratlist$Presbyosmic_3@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+```
+
+## Filter out clusters
+```{r}
+#Create a OSN clusters file
+OSNClusters <- list(
+  "Covid_1" = c(10, 21, 1, 6, 14, 16),
+  "Covid_2" = c(6, 9, 12, 15),
+  "Covid_3" = c(3, 6),
+  "Covid_4" = c(6, 10),
+  "Covid_5" = c(5, 9, 11),
+  "Covid_6" = c(11, 15, 9),
+  "Presbyosmic_1" = c(1, 5, 8, 13, 15, 17, 18, 9, 21),
+  "Presbyosmic_2" = c(11, 16),
+  "Presbyosmic_3" = c(13, 16, 17)
+  )
+
+OSNClusters_df <- enframe(OSNClusters, name = "sample", value = "cluster") %>% unnest(cluster)
+```
+
+### Filter clusters
+```{r}
+disease.seuratlist_OSN <- 
+  lapply(names(disease.seuratlist), function(x) {
+    seurat_obj <- disease.seuratlist[[x]]
+    #Pull clusters to keep from df
+    keep <- OSNClusters_df %>%
+      filter(sample == x) %>%
+      pull(cluster) %>%
+      as.character()
+    #Filter from 0.8 resolution
+    seurat_obj<- subset(seurat_obj, subset = SCT_snn_res.0.8 %in% keep)
+    
+    return(seurat_obj)
+  }) %>% setNames(names(disease.seuratlist))
+```
+
+```{r}
+lapply(disease.seuratlist_OSN, function(x){
+  FeaturePlot(x, features = "Module_Score1", reduction = 'umap', label = TRUE
+              )})
+```
+
+```{r}
+lapply(disease.seuratlist_OSN, function(x){
+  FeaturePlot(x, features = "Module_Score2", reduction = 'umap', label = TRUE
+              )})
+```
+
+## SCTransform
+```{r}
+disease.seuratlist_OSN <- lapply(disease.seuratlist_OSN, function(sample){
+    SCTransform(sample, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+})
+```
+
+## Check clustering
+```{r}
+lapply(disease.seuratlist_OSN, DimPlot)
+```
+
+```{r}
+#saveRDS(disease.seuratlist_OSN, "../outputs/RDS_files/disease/disease.seuratlist_OSN.rds")
+#saveRDS(disease.seuratlist_OSN, "../outputs/RDS_files/disease/disease.seuratlist_OSN2.rds") ##with markers and 0.8 res
+```
+
+```{r}
+disease.seuratlist_OSN <- readRDS("../outputs/RDS_files/disease/disease.seuratlist_OSN2.rds")
+```
+
+## Merge all experiments into one seurat object
+```{r}
+disease.seuratlist_OSN <- lapply(disease.seuratlist_OSN, function(x){
+  x@assays$SCT <- NULL
+  DefaultAssay(x) <- "RNA"
+  return(x)
+})
+
+disease.seuratmerge_OSN <- merge(
+  x = disease.seuratlist_OSN[[1]], y = c(disease.seuratlist_OSN[[2]], disease.seuratlist_OSN[[3]], disease.seuratlist_OSN[[4]], disease.seuratlist_OSN[[5]], disease.seuratlist_OSN[[6]], disease.seuratlist_OSN[[7]], disease.seuratlist_OSN[[8]], disease.seuratlist_OSN[[9]]),
+  merge.data = TRUE,
+  project = "OSN"
+)
+```
+
+## Run SCTransform 
+```{r}
+disease.seuratmerge_OSN <- SCTransform(disease.seuratmerge_OSN, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+## Run PCA and UMAP
+```{r}
+## Perform UMAP reduction
+disease.seuratmerge_OSN <- RunPCA(disease.seuratmerge_OSN)
+disease.seuratmerge_OSN <- RunUMAP(disease.seuratmerge_OSN, dims = 1:50)
+  
+DimPlot(disease.seuratmerge_OSN, reduction = "umap", group.by = "orig.ident")
+FeaturePlot(disease.seuratmerge_OSN, features = "Module_Score1", min.cutoff = 0)
+FeaturePlot(disease.seuratmerge_OSN, features = "Module_Score2", min.cutoff = 0)
+```
+
+## Integration to reduce batch effects
+```{r}
+# Harmony method
+disease.seuratmerge_OSN <- 
+  IntegrateLayers(object = disease.seuratmerge_OSN, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE
+)
+
+options(future.globals.maxSize = 6 * 1024^3)
+
+# RPCA method
+disease.seuratmerge_OSN <- 
+  IntegrateLayers(object = disease.seuratmerge_OSN, method = RPCAIntegration, orig.reduction = "pca", new.reduction = "rpca", verbose = TRUE, normalization.method = "SCT"
+)
+
+#CCA method 
+disease.seuratmerge_OSN <- 
+  IntegrateLayers(object = disease.seuratmerge_OSN, method = CCAIntegration, orig.reduction = "pca", new.reduction = "cca", verbose = TRUE, normalization.method = "SCT"
+)
+```
+
+```{r}
+disease.seuratmerge_OSN <- RunUMAP(disease.seuratmerge_OSN, dims = 1:50, reduction = "harmony", reduction.name = "harmony_umap")
+disease.seuratmerge_OSN <- RunUMAP(disease.seuratmerge_OSN, dims = 1:50, reduction = "rpca", reduction.name = "rpca_umap")
+disease.seuratmerge_OSN <- RunUMAP(disease.seuratmerge_OSN, dims = 1:50, reduction = "cca", reduction.name = "cca_umap")
+```
+
+```{r}
+DimPlot(disease.seuratmerge_OSN, reduction = 'harmony_umap')
+DimPlot(disease.seuratmerge_OSN, reduction = 'rpca_umap')
+DimPlot(disease.seuratmerge_OSN, reduction = 'cca_umap')
+FeaturePlot(disease.seuratmerge_OSN, features = 'Module_Score1', reduction = 'harmony_umap')
+FeaturePlot(disease.seuratmerge_OSN, features = 'Module_Score2', reduction = 'harmony_umap')
+FeaturePlot(disease.seuratmerge_OSN, features = 'Module_Score1', reduction = 'rpca_umap')
+FeaturePlot(disease.seuratmerge_OSN, features = 'Module_Score2', reduction = 'rpca_umap')
+FeaturePlot(disease.seuratmerge_OSN, features = 'Module_Score1', reduction = 'cca_umap')
+FeaturePlot(disease.seuratmerge_OSN, features = 'Module_Score2', reduction = 'cca_umap')
+```
+
+## Cluster again
+```{r}
+res.range <- seq(0.4, 2.4, 0.2)
+
+DefaultAssay(disease.seuratmerge_OSN) <- "SCT"
+disease.seuratmerge_OSN <- FindNeighbors(disease.seuratmerge_OSN, dims = 1:50)
+
+for (res in res.range) {
+    disease.seuratmerge_OSN <- FindClusters(disease.seuratmerge_OSN, resolution = res)
+    U <- DimPlot(disease.seuratmerge_OSN, reduction = "harmony_umap", label = TRUE) +
+      ggtitle(paste("Resolution:", res))
+    print(U)
+}
+```
+
+```{r}
+clustree::clustree(disease.seuratmerge_OSN, prefix = "SCT_snn_res.")
+```
+
+```{r}
+res <- 1 
+
+disease.seuratmerge_OSN <- FindNeighbors(disease.seuratmerge_OSN, verbose = F)
+disease.seuratmerge_OSN <- FindClusters(disease.seuratmerge_OSN, resolution = res, verbose = F)
+
+DimPlot(disease.seuratmerge_OSN, reduction = "harmony_umap", label = TRUE)
+```
+
+```{r}
+#saveRDS(disease.seuratmerge_OSN, '../outputs/RDS_files/disease/disease.seuratmerge_OSN.rds')
+#saveRDS(disease.seuratmerge_OSN, '../outputs/RDS_files/disease/disease.seuratmerge_OSN2.rds') # with marker 
+```
+
+```{r}
+disease.seuratmerge_OSN <- readRDS('../outputs/RDS_files/disease/disease.seuratmerge_OSN2.rds')
+FeaturePlot(disease.seuratmerge_OSN, features = 'STMN2', reduction = 'harmony_umap', label = T)
+```
+
+##Label clusters to keep
+```{r}
+OSNs <- c(13, 18, 21)
+
+disease.seuratmerge_OSN@meta.data$OSNs <- 
+  ifelse(disease.seuratmerge_OSN$SCT_snn_res.1 %in% OSNs, "OSN", "NA")
+
+DimPlot(disease.seuratmerge_OSN, reduction = "harmony_umap", group.by = "OSNs", split.by = 'orig.ident')
+#DimPlot(disease.seuratmerge_OSN, reduction = "harmony_umap", label = TRUE)
+#FeaturePlot(disease.seuratmerge_OSN, features = c("Module_Score1", "Module_Score2"), reduction = "harmony_umap")
+```
+
+##Further remove clusters 
+```{r}
+FeaturePlot(disease.seuratmerge_OSN, reduction = 'harmony_umap', features = c('GAP43', 'DCX', 'GNG8'), label = TRUE)
+
+FeaturePlot(disease.seuratmerge_OSN, reduction = 'harmony_umap', features = c('GNG13', 'STOML3'), label = TRUE)
+
+FeaturePlot(disease.seuratmerge_OSN, reduction = 'harmony_umap', features = c('CNGA2', 'ADCY3', 'GNAL', 'LHX2', 'OMP'), label = TRUE)
+```
+
+## Remove Covid 3 and Presbyosmic 2
+```{r}
+split_list <- SplitObject(disease.seuratmerge_OSN, split.by = "orig.ident")
+
+split_list <- lapply(split_list, function(x){
+  x@assays$SCT <- NULL
+  DefaultAssay(x) <- "RNA"
+  return(x)
+})
+
+disease.seuratmerge_OSN <- merge(
+  x = split_list[[1]], y = c(split_list[[3]], split_list[[4]], split_list[[5]], split_list[[6]], split_list[[8]], split_list[[9]], split_list[[10]]),
+  merge.data = TRUE,
+  project = "OSN"
+)
+```
+
+```{r}
+#Diet seurat did not work
+
+#DefaultAssay(disease.seuratmerge_OSN) <- "RNA"
+
+#disease.subset_OSN <- DietSeurat(
+#  disease.seuratmerge_OSN,
+#  assay = 'RNA',
+#  layers = c("counts.Covid_1", "counts.Covid_2_sample1.Covid2", "counts.Covid_2_sample2.Covid2", #"counts.Covid_4", "counts.Covid_5", "counts.Covid_6", "counts.Presbyosmic_1", #"counts.Presbyosmic_3", "data.Covid_1", "data.Covid_2_sample1.Covid2", #"data.Covid_2_sample2.Covid2", "data.Covid_4", "data.Covid_5", "data.Covid_6", #"data.Presbyosmic_1", "data.Presbyosmic_3")
+#)
+
+#Normalise
+#disease.subset_OSN <- NormalizeData(disease.subset_OSN)
+```
+
+```{r}
+#disease.subset_OSN <- subset(disease.subset_OSN, subset = SCT_snn_res.1 %in% keep)
+disease.subset_OSN <- subset(disease.seuratmerge_OSN, subset = OSNs == "OSN")
+```
+
+## Run SCTransform 
+```{r}
+disease.subset_OSN <- SCTransform(disease.subset_OSN, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+##PCA AND UMAP
+```{r}
+disease.subset_OSN <- RunPCA(disease.subset_OSN)
+disease.subset_OSN <- RunUMAP(disease.subset_OSN, dims = 1:50)
+```
+
+## Integration to reduce batch effects
+```{r}
+# Harmony method
+disease.subset_OSN <- 
+  IntegrateLayers(object = disease.subset_OSN, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony_filt", verbose = FALSE
+)
+```
+
+## Run UMAP
+```{r}
+disease.subset_OSN <- RunUMAP(disease.subset_OSN, dims = 1:50, reduction = "harmony_filt", reduction.name = "harmony_umap")
+```
+
+## Plots
+```{r}
+#FeaturePlots
+FeaturePlot(disease.subset_OSN, features = c("Module_Score2", "Module_Score1"), reduction = "harmony_umap")
+
+#DimPlots
+DimPlot(disease.subset_OSN, group.by = "orig.ident", reduction = "harmony_umap", split.by = "orig.ident", ncol = 2)
+ 
+```
+
+## Cluster again
+```{r}
+res.range <- seq(0.4, 2.4, 0.2)
+
+DefaultAssay(disease.subset_OSN) <- "SCT"
+disease.subset_OSN <- FindNeighbors(disease.subset_OSN, dims = 1:50)
+
+for (res in res.range) {
+    disease.subset_OSN <- FindClusters(disease.subset_OSN, resolution = res)
+    U <- DimPlot(disease.subset_OSN, reduction = "harmony_umap", label = TRUE) +
+      ggtitle(paste("Resolution:", res))
+    print(U)
+}
+```
+
+```{r}
+clustree::clustree(disease.subset_OSN, prefix = "SCT_snn_res.")
+```
+
+```{r}
+res <- 1.2 #change accordingly
+
+disease.subset_OSN <- FindNeighbors(disease.subset_OSN, verbose = F)
+disease.subset_OSN <- FindClusters(disease.subset_OSN, resolution = res, verbose = F)
+```
+
+```{r}
+DimPlot(disease.subset_OSN, reduction = "harmony_umap", label = TRUE)
+FeaturePlot(disease.subset_OSN, reduction = 'harmony_umap', features = 'Module_Score1', label = TRUE)
+FeaturePlot(disease.subset_OSN, reduction = 'harmony_umap', features = 'Module_Score2')
+FeaturePlot(disease.subset_OSN, reduction = 'harmony_umap', features = c('GAP43', 'DCX', 'GNG8'))
+FeaturePlot(disease.subset_OSN, reduction = 'harmony_umap', features = c('ADCY3', 'GNAL', 'CNGA2', 'LHX2', 'OMP'))
+```
+
+##label OSNs
+```{r}
+iOSNs <- c('0', '1', '3', '4', '5', '6')
+mOSNs <- '2'
+
+disease.subset_OSN@meta.data$label <- 
+  ifelse(disease.subset_OSN$seurat_clusters %in% iOSNs, "iOSN",
+         ifelse(disease.subset_OSN$seurat_clusters %in% mOSNs, "mOSN","NA"))
+```
+
+```{r}
+#saveRDS(disease.subset_OSN, "../outputs/RDS_files/disease/disease.subset_OSN.rds")
+disease.subset_OSN <- readRDS("../outputs/RDS_files/disease/disease.subset_OSN.rds")
+```
+
+```{r}
+p1 <- DimPlot(disease.subset_OSN, reduction = "harmony_umap", group.by = 'label') + labs(title = "Patient - OSNs")
+p2 <- DimPlot(disease.subset_OSN, reduction = "harmony_umap", group.by = 'orig.ident')
+
+p3 <- FeaturePlot(disease.subset_OSN, features = "Module_Score1", reduction = "harmony_umap")
+p4 <- FeaturePlot(disease.subset_OSN, features = "Module_Score2", reduction = "harmony_umap")
+
+comb <- (p1|p2)/(p3|p4)
+
+FeaturePlot(disease.subset_OSN, reduction = 'harmony_umap', features = c('GAP43', 'DCX', 'GNG8'))
+FeaturePlot(disease.subset_OSN, reduction = 'harmony_umap', features = c('GNG13', 'STOML3', 'ADCY3'))
+```
+
+## Merge Healthy OSN and Disease
+```{r}
+disease.subset_OSN <- readRDS("../outputs/RDS_files/disease/disease.subset_OSN.rds")
+samples.seurat <- readRDS('../outputs/RDS_files/samples/samples.seuratpseudorank_june.rds')
+```
+
+```{r}
+disease.subset_OSN@assays$SCT <- NULL
+DefaultAssay(disease.subset_OSN) <- "RNA"
+samples.seurat@assays$SCT <- NULL
+DefaultAssay(samples.seurat) <- "RNA"
+
+disam.seuratmerge <- merge(x = disease.subset_OSN, y = samples.seurat, merge.data = TRUE,
+  project = "disease_sample")
+```
+
+### Run SCTransform 
+```{r}
+disam.seuratmerge <- SCTransform(disam.seuratmerge, method = "glmGamPoi", 
+                vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+### Run PCA and UMAP
+```{r}
+## Perform UMAP reduction
+disam.seuratmerge <- RunPCA(disam.seuratmerge)
+disam.seuratmerge <- RunUMAP(disam.seuratmerge, dims = 1:50)
+```
+
+### Integration to reduce batch effects
+```{r}
+# Harmony method
+disam.seuratmerge <- 
+  IntegrateLayers(object = disam.seuratmerge, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE
+)
+
+#options(future.globals.maxSize = 6 * 1024^3)
+
+# RPCA method
+#disam.seuratmerge <- 
+# IntegrateLayers(object = disam.seuratmerge, method = RPCAIntegration, orig.reduction = #"pca", new.reduction = "rpca", verbose = TRUE, normalization.method = "SCT"
+#)
+
+#CCA method 
+#disam.seuratmerge <- 
+#  IntegrateLayers(object = disam.seuratmerge, method = CCAIntegration, orig.reduction = "pca", #new.reduction = "cca", verbose = TRUE, normalization.method = "SCT"
+#)
+```
+
+### Run UMAP
+```{r}
+disam.seuratmerge <- RunUMAP(disam.seuratmerge, dims = 1:50, reduction = "harmony", reduction.name = "harmony_umap")
+```
+
+### Cluster
+```{r}
+res.range <- seq(0.4, 2.4, 0.2)
+
+DefaultAssay(disam.seuratmerge) <- "SCT"
+disam.seuratmerge <- FindNeighbors(disam.seuratmerge, dims = 1:50)
+
+for (res in res.range) {
+    disam.seuratmerge <- FindClusters(disam.seuratmerge, resolution = res)
+    U <- DimPlot(disam.seuratmerge, reduction = "harmony_umap", label = TRUE) +
+      ggtitle(paste("Resolution:", res))
+    print(U)
+}
+```
+
+```{r}
+clustree::clustree(disam.seuratmerge, prefix = "SCT_snn_res.")
+```
+
+```{r}
+res <- 1.2  #change accordingly
+disam.seuratmerge <- FindNeighbors(disam.seuratmerge, verbose = F)
+disam.seuratmerge <- FindClusters(disam.seuratmerge, resolution = res, verbose = F)
+```
+
+```{r}
+DimPlot(disam.seuratmerge, reduction = 'harmony_umap', group.by = 'label')
+DimPlot(disam.seuratmerge, reduction = 'harmony_umap', group.by = 'orig.ident')
+```
+
+```{r}
+#saveRDS(disam.seuratmerge, "../outputs/RDS_files/disease/disam.seuratmerge_june.rds")
+```
+
+```{r}
+disam.seuratmerge <- readRDS("../outputs/RDS_files/disease/disam.seuratmerge_june.rds")
+```
+
+###Add condition variables
+```{r}
+disam.seuratmerge$condition <- ifelse(
+  disam.seuratmerge$orig.ident %in% c("control1", "control2", "control3", "patient1", "patient2", "patient4"), "Control",
+  ifelse(disam.seuratmerge$orig.ident %in% c("Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_4", "Covid_5", "Covid_6", "Presbyosmic_1", "Presbyosmic_3"), "Patient", "Other"))
+
+disam.seuratmerge$study <- ifelse(
+  disam.seuratmerge$orig.ident %in% c("Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_4", "Covid_5", "Covid_6"), "Covid",
+  ifelse(disam.seuratmerge$orig.ident %in% c("patient1", "patient2", "patient4"), "Patients",
+         ifelse(disam.seuratmerge$orig.ident %in% c("Presbyosmic_1", "Presbyosmic_3", "control1", "control2", "control3"), "PreControl", "Other"))
+)
+
+disam.seuratmerge$Disease_type <-  ifelse(
+  disam.seuratmerge$orig.ident %in% c("Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_4", "Covid_5", "Covid_6"), "Covid",
+  ifelse(disam.seuratmerge$orig.ident %in% c("Presbyosmic_1", "Presbyosmic_3"),"Presbyosmic", "Healthy"))
+
+disam.seuratmerge$FH_group <- ifelse(
+  disam.seuratmerge$orig.ident %in% c("control1", "control2", "control3"),"Control",
+      ifelse(disam.seuratmerge$orig.ident %in% c("Presbyosmic_1", "Presbyosmic_3", "Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_4", "Covid_5", "Covid_6"),"Disease", "patients"))
+```
+
+```{r}
+disam.seuratmerge$orig.ident <- factor(disam.seuratmerge$orig.ident, c("control1", "control2", "control3", "patient1", "patient2", "patient4", "Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_4", "Covid_5", "Covid_6", "Presbyosmic_1", "Presbyosmic_3"))
+
+DimPlot(disam.seuratmerge, reduction = 'harmony_umap', split.by = 'orig.ident', ncol = 4, order = 'condition', group.by = 'label')
+```
+
+```{r}
+avgexp_iosn <- AverageExpression(subset(disam.seuratmerge, label == "iOSN"), assays = "SCT", group.by = "orig.ident")$SCT
+pheatmap::pheatmap(cor(as.matrix(avgexp_iosn)), cluster_rows = T, cluster_cols = T)
+
+avgexp_mosn <- AverageExpression(subset(disam.seuratmerge, label == "mOSN"), assays = "SCT", group.by = "orig.ident")$SCT
+pheatmap::pheatmap(cor(as.matrix(avgexp_mosn)), cluster_rows = T, cluster_cols = T)
+
+avgexp <- AverageExpression(disam.seuratmerge, assays = "SCT", group.by = "orig.ident")$SCT
+pheatmap::pheatmap(cor(as.matrix(avgexp)), cluster_rows = T, cluster_cols = T)
+
+new_labels <- c(
+  "control1", "control2", "control3",
+  "control4", "control5", "control6",
+  "Covid_1", "Covid_2_sample1", "Covid_2_sample2", "Covid_4", "Covid_5", "Covid_6",
+  "Presbyosmic_1", "Presbyosmic_3"
+)
+
+cor_matrix <- cor(as.matrix(avgexp))
+
+rownames(cor_matrix) <- new_labels
+colnames(cor_matrix) <- new_labels
+pheatmap::pheatmap(
+  cor_matrix,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE
+)
+```
+
+###Differential Expression
+###Compare with removed patient1,4, Covid_2_sample1 and Covid_2_sample2
+```{r}
+Idents(disam.seuratmerge) <- "condition"
+to.keep <- disam.seuratmerge@meta.data %>%
+  filter(!orig.ident %in% c("patient1","patient4", "Covid_2_sample1", "Covid_2_sample2")) %>%
+  rownames()
+
+diff_merge <- PrepSCTFindMarkers(subset(disam.seuratmerge, cells = to.keep))
+
+options(future.globals.maxSize = 8 * 1024^3)
+diff_exp <- FindMarkers(diff_merge, ident.1 = "Patient", ident.2 = "Control", verbose = FALSE, assay = "SCT", logfc.threshold = 0.25, min.pct = 0.1)
+
+diff_exp$gene <- rownames(diff_exp)
+diff_exp$direction <- ifelse(
+  diff_exp$p_val_adj < 0.05 & diff_exp$avg_log2FC > 0.25, "Upregulated",
+  ifelse(diff_exp$p_val_adj < 0.05 & diff_exp$avg_log2FC < -0.25, "Downregulated", "Not Significant"))
+
+table(diff_exp$direction)
+```
+###Check for AIS genes in up or down regulated genes
+```{r}
+Upregulated <- diff_exp %>% filter(direction == 'Upregulated') %>% pull(gene)
+Downregulated <- diff_exp %>% filter(direction == 'Downregulated') %>% pull(gene)
+
+AIS <- read.csv('../originals/Matt_AIS_list.csv')
+AIS <- unique(AIS)
+AIS$human_gene <- NA
+out <- gprofiler2::gorth(AIS$Genes,
+        source_organism = "mmusculus",
+        target_organism = "hsapiens")
+AIS$human_gene[out$input_number] <- out$ortholog_name
+
+AIS_downregulated <- intersect(AIS$human_gene, Downregulated)
+AIS_upregulated <- intersect(AIS$human_gene, Upregulated)
+```
+
+```{r}
+Idents(disam.seuratmerge) <- "condition"
+VlnPlot(disam.seuratmerge, AIS_upregulated[1:6])
+VlnPlot(disam.seuratmerge, AIS_upregulated[7:10])
+```
+
+###Volcano Plot
+```{r}
+##average expression
+#avg_exp <- Matrix::rowMeans(disam.seuratmerge@assays$SCT@data)
+#diff_exp$avg_expression <- avg_exp[rownames(diff_exp)]
+
+top_genes <- diff_exp %>%
+  filter(direction != "Not Significant") %>%
+  arrange(p_val_adj) %>%
+  head(10)
+
+AIS_genes <- diff_exp %>%
+  filter(rownames(diff_exp) %in% AIS_upregulated) %>%
+  arrange(p_val_adj)
+
+ggplot(diff_exp, aes(x = avg_log2FC, y = -log10(p_val_adj), colour = direction)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "red", 
+                                "Downregulated" = "blue", 
+                                "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "black") +
+  theme_minimal() +
+  labs(title = "Patient vs Control",
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value",
+       colour = "Significance") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_text_repel(
+  data = AIS_genes,
+  aes(x = avg_log2FC, y = -log10(p_val_adj), label = gene),
+  size = 3,
+  box.padding = 1.5,
+  point.padding = 1.5,
+  max.overlaps = Inf,
+  force = 2,
+  direction = "y",             
+  hjust = 0,                   
+  nudge_x = 1.5,
+  segment.size = 0.2
+)
+```
+
+```{r}
+Idents(disam.seuratmerge) <- "condition"
+VlnPlot(disam.seuratmerge, c("TUBB3"))
+
+VlnPlot(
+  disam.seuratmerge,
+  features = "TUBB3",
+  idents = setdiff(levels(disam.seuratmerge), c("patient1", "patient4", "control1"))
+)
+
+Idents(disam.seuratmerge) <- "orig.ident"
+VlnPlot(disam.seuratmerge, c("TUBB3"))
+```
+
+###Gene Ontology
+```{r}
+universe <- rownames(disam.seuratmerge)
+
+up_regulated <- diff_exp %>% filter(direction == 'Upregulated') %>% pull(gene)
+down_regulated <- diff_exp %>% filter(direction == 'Downregulated') %>% pull(gene)
+
+diff_exp_upgo <- enrichGO(gene = up_regulated,
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = universe,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+diff_exp_upgo_results <- diff_exp_upgo@result
+
+diff_exp_downgo <- enrichGO(gene = down_regulated,
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = universe,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+diff_exp_downgo_results <- diff_exp_downgo@result
+
+AIS_up <- enrichGO(gene = AIS_upregulated,
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = universe,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+AIS_up_results <- AIS_up@result %>% arrange(p.adjust)
+```
+
+```{r}
+diff_exp_upgo_results %>% arrange(p.adjust) %>% arrange(pvalue) #%>% slice_head(n =10)
+diff_exp_downgo_results %>% arrange(p.adjust) %>% arrange(pvalue)# %>% slice_head(n =10)
+```
+
+###RRVGO
+```{r}
+simMatrix_diffup <- calculateSimMatrix(diff_exp_upgo_results$ID,
+                                orgdb="org.Hs.eg.db",
+                                ont="BP",
+                                method="Rel")
+
+scores_diffup <- setNames(-log10(diff_exp_upgo_results$p.adjust), diff_exp_upgo_results$ID)
+
+rvgo_diffup <- reduceSimMatrix(simMatrix_diffup, scores_diffup, threshold = 0.7, orgdb = "org.Hs.eg.db")
+```
+
+```{r}
+rvgo_diffup_filtered <- rvgo_diffup %>% filter(go == parent)
+```
+
+```{r}
+simMatrix_diffdown <- calculateSimMatrix(diff_exp_downgo_results$ID,
+                                orgdb="org.Hs.eg.db",
+                                ont="BP",
+                                method="Rel")
+
+scores_diffdown <- setNames(-log10(diff_exp_downgo_results$p.adjust), diff_exp_downgo_results$ID)
+
+rvgo_diffdown <- reduceSimMatrix(simMatrix_diffdown, scores_diffdown, threshold = 0.7, orgdb = "org.Hs.eg.db")
+```
+
+```{r}
+rvgo_diffdown_filtered <- rvgo_diffdown %>% filter(go == parent)
+```
+
+###AIS RVGO
+```{r}
+simMatrix_diffAIS <- calculateSimMatrix(AIS_up_results$ID,
+                                orgdb="org.Hs.eg.db",
+                                ont="BP",
+                                method="Rel")
+
+scores_diffAIS <- setNames(-log10(AIS_up_results$p.adjust), AIS_up_results$ID)
+
+rvgo_diffAIS <- reduceSimMatrix(simMatrix_diffAIS, scores_diffAIS, threshold = 0.7, orgdb = "org.Hs.eg.db")
+
+rvgo_diffAIS_filtered <- rvgo_diffAIS %>% filter(go == parent)
+```
+
+###Plot gene ontology
+```{r}
+plot_function3 <- function(df, title) {
+  df %>% 
+  slice_head(n =10) %>%
+  ggplot(aes(x = score, y = reorder(term, score), fill = score)) +  
+    geom_bar(stat = "identity", width = 0.5) +  
+    scale_fill_gradient(low = "blue", high = "red") +  
+    theme_minimal() +
+    labs(x = "Score", y = "Term", fill = "Score", title = title) +
+    theme(
+      axis.text.y = element_text(size = 10, color = "black"),  # Bigger and darker terms
+      axis.text.x = element_text(size = 12, color = "black"),
+      axis.title = element_text(size = 14, color = "black"),
+      plot.title = element_text(size = 16, face = "bold", color = "black")
+    )
+}
+
+#diff_exp_downgo_results[c(1,2,3,5,6,7,8,12,13,14),]
+
+plot_function3(rvgo_diffdown_filtered[c(1:6, 9, 13:15),], paste("Down-regulated Terms"))
+plot_function3(rvgo_diffup_filtered, paste("Up-regulated Terms"))
+plot_function3(rvgo_diffAIS_filtered, paste("AIS Up-regulated Terms"))
+```
+
+###Compare between diseases
+```{r}
+Idents(diff_merge) <- "Disease_type"
+diff_exp_disease <- FindMarkers(diff_merge, ident.1 = "Covid", ident.2 = "Presbyosmic", verbose = FALSE, assay = "SCT", logfc.threshold = 0.25, min.pct = 0.1)
+
+diff_exp_disease$gene <- rownames(diff_exp_disease)
+diff_exp_disease$direction <- ifelse(
+  diff_exp_disease$p_val_adj < 0.05 & diff_exp_disease$avg_log2FC > 0.25, "Upregulated",
+  ifelse(diff_exp_disease$p_val_adj < 0.05 & diff_exp_disease$avg_log2FC < -0.25, "Downregulated", "Not Significant"))
+
+Upregulated_patients <- diff_exp_disease %>% filter(direction == "Upregulated")
+Downregulated_patients <- diff_exp_disease %>% filter(direction == "Downregulated")
+intersect(AIS, Downregulated_patients)
+intersect(AIS, Upregulated_patients)
+```
+
+###Compare covid
+```{r}
+Idents(diff_merge) <- "Disease_type"
+diff_exp_covid <- FindMarkers(diff_merge, ident.1 = "Covid", ident.2 = "Healthy", verbose = FALSE, assay = "SCT", logfc.threshold = 0.25, min.pct = 0.1)
+
+diff_exp_covid$gene <- rownames(diff_exp_covid)
+diff_exp_covid$direction <- ifelse(
+  diff_exp_covid$p_val_adj < 0.05 & diff_exp_covid$avg_log2FC > 0.25, "Upregulated",
+  ifelse(diff_exp_covid$p_val_adj < 0.05 & diff_exp_covid$avg_log2FC < -0.25, "Downregulated", "Not Significant"))
+
+table(diff_exp_covid$direction)
+
+Upregulated_covid <- diff_exp_covid %>% filter(direction == 'Upregulated') %>% pull(gene)
+Downregulated_covid <- diff_exp_covid %>% filter(direction == 'Downregulated') %>% pull(gene)
+
+intersect(AIS$human_gene, Downregulated_covid)
+AIS_upregulated_covid <- intersect(AIS$human_gene, Upregulated_covid)
+
+AIS_genes_covid <- diff_exp_covid %>%
+  filter(rownames(diff_exp_covid) %in% AIS_upregulated_covid) %>%
+  arrange(p_val_adj)
+
+covid_vlc <- ggplot(diff_exp_covid, aes(x = avg_log2FC, y = -log10(p_val_adj), colour = direction)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "red", 
+                                "Downregulated" = "blue", 
+                                "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "black") +
+  theme_minimal() +
+  labs(title = "COVID vs Control",
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value",
+       colour = "Significance") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_text_repel(
+  data = AIS_genes_covid,
+  aes(x = avg_log2FC, y = -log10(p_val_adj), label = gene),
+  size = 3,
+  box.padding = 1,
+  point.padding = 0.5,
+  max.overlaps = Inf,
+  direction = "y",             
+  hjust = 0,                   
+  nudge_x = 1.5                
+)
+```
+
+###Compare presbyosmic
+```{r}
+Idents(diff_merge) <- "Disease_type"
+diff_exp_presbyosmic <- FindMarkers(diff_merge, ident.1 = "Presbyosmic", ident.2 = "Healthy", verbose = FALSE, assay = "SCT", logfc.threshold = 0.25, min.pct = 0.1)
+
+diff_exp_presbyosmic$gene <- rownames(diff_exp_presbyosmic)
+diff_exp_presbyosmic$direction <- ifelse(
+  diff_exp_presbyosmic$p_val_adj < 0.05 & diff_exp_presbyosmic$avg_log2FC > 0.25, "Upregulated",
+  ifelse(diff_exp_presbyosmic$p_val_adj < 0.05 & diff_exp_presbyosmic$avg_log2FC < -0.25, "Downregulated", "Not Significant"))
+
+table(diff_exp_presbyosmic$direction)
+
+Upregulated_presbyosmic <- diff_exp_presbyosmic %>% filter(direction == 'Upregulated') %>% pull(gene)
+Downregulated_presbyosmic <- diff_exp_presbyosmic %>% filter(direction == 'Downregulated') %>% pull(gene)
+
+intersect(AIS$human_gene, Downregulated_presbyosmic)
+intersect(AIS$human_gene, Upregulated_presbyosmic)
+
+AIS_genes_presbyosmic <- diff_exp_presbyosmic %>%
+  filter(rownames(diff_exp_presbyosmic) %in% intersect(AIS$human_gene, Upregulated_presbyosmic)) %>%
+  arrange(p_val_adj)
+
+pre_vlc <- ggplot(diff_exp_presbyosmic, aes(x = avg_log2FC, y = -log10(p_val_adj), colour = direction)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "red", 
+                                "Downregulated" = "blue", 
+                                "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "black") +
+  theme_minimal() +
+  labs(title = "Presbyosmic vs Control",
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value",
+       colour = "Significance") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_text_repel(
+  data = AIS_genes_presbyosmic,
+  aes(x = avg_log2FC, y = -log10(p_val_adj), label = gene),
+  size = 3,
+  box.padding = 1,
+  point.padding = 0.5,
+  max.overlaps = Inf,
+  direction = "y",             
+  hjust = 0,                   
+  nudge_x = 1.5                
+)
+```
+
+###Compare group
+```{r}
+Idents(disam.seuratmerge) <- "FH_group"
+diff_exp_controls <- FindMarkers(disam.seuratmerge, ident.1 = "Disease", ident.2 = "patients", verbose = FALSE, assay = "SCT", logfc.threshold = 0.25, min.pct = 0.1)
+
+diff_exp_controls$gene <- rownames(diff_exp_controls)
+diff_exp_controls$direction <- ifelse(
+  diff_exp_controls$p_val_adj < 0.05 & diff_exp_controls$avg_log2FC > 0.25, "Upregulated",
+  ifelse(diff_exp_controls$p_val_adj < 0.05 & diff_exp_controls$avg_log2FC < -0.25, "Downregulated", "Not Significant"))
+
+table(diff_exp_controls$direction)
+```
+
+```{r}
+covid <- diff_exp_covid %>% filter(direction != "Not Significant")
+presbyosmic <- diff_exp_presbyosmic %>% filter(direction != "Not Significant")
+
+setdiff(rownames(covid), rownames(presbyosmic))
+setdiff(rownames(presbyosmic), rownames(covid))
+
+intersect(AIS, setdiff(rownames(presbyosmic), rownames(covid))) #No AIS genes present
+intersect(rownames(presbyosmic), rownames(covid))
+```
+
+##Calculate proportions of cells
+```{r}
+disease_all.list <- readRDS("../outputs/RDS_files/disease/disease.seuratlistMS2.rds")
+samples_all.list <- readRDS("../outputs/RDS_files/samples/samples.seuratlistMS.rds")
+disease.subset_OSN <- readRDS("../outputs/RDS_files/disease/disease.subset_OSN.rds")
+samples.seurat <- readRDS('../outputs/RDS_files/samples/samples.seuratpseudorank_june.rds')
+```
+
+###check OSN cell identities in samples and calculate proportions
+```{r}
+samples.seurat_list <- SplitObject(samples.seurat, split.by = 'orig.ident')
+
+#remove objects that are no longer part of analysis
+samples_all.list[[6]] <- NULL
+```
+
+```{r}
+OSN_list_samples <- lapply(samples.seurat_list, function(x) {
+  keep <- length(colnames(x))
+  return(keep)
+})
+
+allCT_list_samples <- lapply(samples_all.list, function(x) {
+  keep <- length(colnames(x))
+  return(keep)
+})
+
+props_samples <- mapply(function(x, y) {
+  (x / y) * 100
+}, OSN_list_samples, allCT_list_samples)
+```
+
+###check OSN cell identities in disease and calculate proportions
+```{r}
+disease_subset_list <- SplitObject(disease.subset_OSN, split.by = 'orig.ident')
+
+#merge back sample 2
+disease_subset_list[["Covid_2"]] <- merge(x = disease_subset_list[[7]], y = disease_subset_list[[8]], merge.data = TRUE)
+
+#remove remaining sample after merge
+disease_subset_list[["Covid_2_sample1"]] <- NULL
+disease_subset_list[["Covid_2_sample2"]] <- NULL
+
+#remove objects that are no longer part of analysis
+disease_all.list[["Covid_3"]] <- NULL
+disease_all.list[["Presbyosmic_2"]] <- NULL
+
+```
+
+```{r}
+OSN_list_disease <- lapply(disease_subset_list, function(x) {
+  keep <- length(colnames(x))
+  return(keep)
+})
+
+allCT_list_disease <- lapply(disease_all.list, function(x) {
+  keep <- length(colnames(x))
+  return(keep)
+})
+
+props_disease <- mapply(function(x, y) {
+  (x / y) * 100
+}, OSN_list_disease, allCT_list_disease)
+```
+
+###check difference
+```{r}
+avg_prop_samples <- mean(props_samples)
+avg_prop_disease <- mean(props_disease)
+
+wilcox.test(props_samples, props_disease)
+```
+
+```{r}
+OSN_proportions <- c(props_samples, props_disease)
+
+OSN_proportions <- data.frame(
+  Sample = factor(names(OSN_proportions), levels = names(OSN_proportions)),
+  Proportion = as.numeric(OSN_proportions)
+)
+
+OSN_proportions$Condition <- ifelse(OSN_proportions$Sample %in% c("control1", "control2", "control3", "patient1", "patient2", "patient4"), "Control",
+                             ifelse(OSN_proportions$Sample %in% c("Covid_1", "Covid_2", "Covid_4", "Covid_5", "Covid_6"), "Covid",
+                             ifelse(OSN_proportions$Sample %in% c("Presbyosmic_1", "Presbyosmic_3"), "Presbyosmic", "Other")))
+
+ggplot(OSN_proportions, aes(x = Condition, y = Proportion, fill = Proportion)) +
+  geom_col(width = 0.5, color = "black") +
+  scale_fill_gradient(
+    low = "lightblue",  # light muted teal
+    high = "#8C6BB1"  # muted purple
+  ) +
+  labs(
+    title = "Proportion of OSNs",
+    x = "Sample",
+    y = "Proportion"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  )
+```
+
+```{r}
+OSN_proportions$Sample <- sub("patient1", "control4", OSN_proportions$Sample)
+OSN_proportions$Sample <- sub("patient2", "control5", OSN_proportions$Sample)
+OSN_proportions$Sample <- sub("patient4", "control6", OSN_proportions$Sample)
+
+prop_bar <- ggplot(OSN_proportions, aes(x = factor(Sample, levels = c("control1", "control2", "control3", "control4", "control5", "control6", "Covid_1", "Covid_2", "Covid_4", "Covid_5", "Covid_6", "Presbyosmic_1", "Presbyosmic_3")), y = Proportion, fill = Condition)) +
+  geom_col(width = 0.5, color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Proportion of OSNs",
+    x = "Sample",
+    y = "Proportion %"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid.major.x = element_blank()
+  )
+
+```
+
+```{r}
+Idents(disam.seuratmerge) <- "orig.ident"
+VlnPlot(disam.seuratmerge, features = AIS_upregulated)
+```
+
