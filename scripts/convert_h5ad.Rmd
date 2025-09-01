@@ -1,0 +1,146 @@
+---
+title: "convert"
+output: html_document
+date: "2025-02-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+extractH5ad <- function(h5ad, save.rds = FALSE, rds.path = NULL, verbose = TRUE) {
+  # Check mandatory input
+  if(verbose){.outputMsg("Checking input parameters.")}
+  if (missing(h5ad)) {
+      .outputMsg("Provide valid h5ad fileor url.", type = 'abort')
+    stop()
+  }
+  temp_file <- NULL
+  # Check if 'h5ad' is a URL
+  if (grepl("^http[s]?://", h5ad)) {
+    # Download the file
+    if (verbose) {.outputMsg(paste("Downloading h5ad file from: ", h5ad))}
+    tmp_file <- tempfile(fileext = ".h5ad")
+    curl::curl_download(h5ad, destfile = tmp_file, quiet = !verbose)
+    h5ad <- tmp_file
+    on.exit({
+      if (!is.null(temp_file) && file.exists(temp_file)) {
+        file.remove(temp_file)
+      }
+    }, add = TRUE)
+  }
+  # Ensure that the 'anndata' Python package is installed and available
+  anndata <- reticulate::import("anndata")
+  # Read the h5ad file
+  adata <- anndata$read_h5ad(h5ad)
+  features <- unlist(adata$var_names$to_list())
+  cells <- unlist(adata$obs_names$to_list())
+  # Extracting elements in h5ad file
+  # Normalised counts
+  if (verbose) {.outputMsg("Inspecting h5ad file.")}
+  if (is.null(adata$X)) {
+    .outputMsg("No expression data found in file.", type = 'abort')
+    stop()
+  } else {
+    .outputMsg("Normalised counts found.")
+    norm.cnt <- as(t(as.matrix(adata$X)), "dgCMatrix")
+    rownames(norm.cnt) <- features  # Setting row names
+    colnames(norm.cnt) <- cells  # Setting column names
+  }
+  # Raw counts
+  if (!is.null(adata$raw)) {
+    .outputMsg("Raw counts found.")
+    raw.cnt <- as(t(as.matrix(adata$raw$X)), "dgCMatrix")
+    rownames(raw.cnt) <- features  # Setting row names
+    colnames(raw.cnt) <- cells  # Setting column names
+    if (!is.integer(raw.cnt)) {
+      .outputMsg("Raw counts appear to be of float type.", type = 'warn')
+    }
+  } else {
+    .outputMsg("No raw counts found.", type = 'warn')
+    raw.cnt <- NULL
+  }
+  # Metadata
+  if (!is.null(adata$obs)) {
+    .outputMsg("Metadata found.")
+    metadata <- adata$obs
+  } else {
+    .outputMsg("Metadata not found.", type = 'warn')
+    metadata <- NULL
+  }
+  # Embeddings
+  if (!is.null(adata$obsm)) {
+    embeddings_names <- strsplit(sub(".*: ", "", adata$obsm), ", ")[[1]]
+    if (length(embeddings_names) > 0) {
+      .outputMsg(paste("The following embeddings were found:", paste(embeddings_names, collapse = ", ")))
+    }
+  } else {
+    .outputMsg("No embeddings found.", type = 'warn')
+  }
+  # Creating Seurat Objects
+  if (!is.null(raw.cnt)) {
+    if (!is.null(metadata)) {
+      .outputMsg("Creating Seurat object using raw counts and metadata extracted.")
+      seurat.obj <- Seurat::CreateSeuratObject(raw.cnt, assay = "RNA", meta.data = metadata)
+    } else {
+      .outputMsg("Creating Seurat object using raw counts extracted.")
+      seurat.obj <- Seurat::CreateSeuratObject(raw.cnt, assay = "RNA")
+    }
+  } else {
+    if (!is.null(metadata)) {
+      .outputMsg("Creating Seurat object using normalised counts and metadata extracted.", type = 'warn')
+      seurat.obj <- Seurat::CreateSeuratObject(norm.cnt, assay = "RNA", meta.data = metadata)
+    } else {
+      .outputMsg("Creating Seurat object using normalised counts extracted.", type = 'warn')
+      seurat.obj <- Seurat::CreateSeuratObject(norm.cnt, assay = "RNA")
+    }
+  }
+  # Appending normalised counts
+  seurat.obj <- Seurat::SetAssayData(object = seurat.obj, slot = "data", new.data = norm.cnt)
+  # Appending Embeddings
+  if (length(embeddings_names) > 0) {
+    for (emb in embeddings_names) {
+      dimred.df <- adata$obsm[[emb]]
+      dimred <- str_remove(emb, "X_")
+      if (!is.null(dimred.df)) {
+        rownames(dimred.df) <- cells
+        colnames(dimred.df) <- paste0(dimred, "_", seq_len(ncol(dimred.df)))
+        # Save embedding into the Seurat object
+        seurat.obj[[dimred]] <- Seurat::CreateDimReducObject(embeddings = dimred.df, key = paste0(dimred, "_"), assay = Seurat::DefaultAssay(seurat.obj))
+        .outputMsg(paste("Saved embedding:", dimred))
+      }
+    }
+  }
+  # Save as RDS file if specified
+  if (save.rds && !is.null(rds.path)) {
+    saveRDS(seurat.obj, file = rds.path)
+    .outputMsg(paste(rds.path, "file successfully created."))
+  }
+  # Return the Seurat object
+  return(seurat.obj)
+}
+# output messages
+.outputMsg <- function(text, type = 'info'){
+    warnorng <- crayon::make_style('darkgoldenrod3')
+    abortred <- crayon::make_style('red3')
+    infogreen <- crayon::make_style('darkolivegreen4')
+    if(type == 'warn'){
+        rlang::inform(warnorng(stringr::str_glue(cli::symbol$warning, ' ', text)))
+    } else if(type == 'abort'){
+        rlang::inform(abortred(stringr::str_glue(cli::symbol$cross, ' ', text)))
+    } else {
+        rlang::inform(infogreen(stringr::str_glue(cli::symbol$pointer, ' ', text)))
+    }
+}
+```
+
+```{r}
+#' ## Converting H5AD file to Seurat object
+refneurons.obj <- extractH5ad("originals/WHB-10Xv3-Neurons-raw.h5ad")
+#refneurons.obj <- extractH5ad("https://allen-brain-cell-atlas.s3-us-west-2.amazonaws.com/expression_matrices/WHB-10Xv3/20240330/WHB-10Xv3-Neurons-raw.h5ad")
+#'
+#' @returns A Seurat object with all the elements found in the H5AD file.
+#' @export
+```
+

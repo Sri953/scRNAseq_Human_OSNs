@@ -1,0 +1,595 @@
+---
+title: "AIS_Gene_Expression"
+author: "Srilakshmi"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Comparing gene expression profiles between cortical neurons and OSNs
+# Import reference dataset - cortical neurons
+```{r}
+seurat.refV1C <- readRDS("../originals/seurat_ref_V1C.rds")
+```
+
+```{r}
+DimPlot(seurat.refV1C, reduction = "UMAP", group.by = "supercluster_term", label = TRUE)
+head(seurat.refV1C)
+```
+
+```{r}
+mart = useMart("ensembl")
+mart <- useMart(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+us_mart <- useEnsembl(biomart = "ensembl",dataset="hsapiens_gene_ensembl", mirror = "useast")
+```
+
+```{r}
+View(listAttributes(us_mart))
+
+id_name <- getBM(c("ensembl_gene_id", "external_gene_name"), mart = us_mart)
+```
+
+## Filter vector for genes in seurat.refV1C
+```{r}
+rownames(seurat.refV1C)
+
+in_ref <- id_name[id_name$ensembl_gene_id %in% rownames(seurat.refV1C), ]
+
+in_ref <- distinct(in_ref, ensembl_gene_id, .keep_all = TRUE)
+```
+
+## Order in terms of layout in seurat
+```{r}
+# Keep gene id if gene name is blank
+in_ref$external_gene_name[in_ref$external_gene_name == ""] <- in_ref$ensembl_gene_id[in_ref$external_gene_name == ""]
+
+```
+
+```{r}
+#Extract counts matrix
+counts_matrix <- GetAssayData(seurat.refV1C, layer = "counts")
+
+# Check for genes in counts_matrix but not in in_ref
+missing_genes_in_ref <- setdiff(rownames(counts_matrix), in_ref$ensembl_gene_id)
+
+# Number of missing genes
+length(missing_genes_in_ref) 
+
+# Check which missing genes are in the Seurat object
+missing_genes_in_seurat <- missing_genes_in_ref[missing_genes_in_ref %in% rownames(seurat.refV1C)]
+
+# Subset the counts_matrix for missing genes that are not in id_name
+missing_gene_counts <- counts_matrix[missing_genes_in_ref, , drop = FALSE]
+
+# Sum counts across all cells for each missing gene
+gene_sums <- rowSums(missing_gene_counts)
+```
+
+```{r}
+#Add genes found in counts matrix into in_ref
+missing_df <- data.frame(ensembl_gene_id = missing_genes_in_seurat, external_gene_name = missing_genes_in_seurat)
+
+in_ref <- rbind(in_ref, missing_df)
+
+in_ref <- in_ref[order(match(in_ref$ensembl_gene_id, rownames(seurat.refV1C))), ]
+```
+
+## Collapse into new seurat.obj
+```{r}
+#ref_counts   <- aggregate(counts_matrix[in_ref$ensembl_gene_id, ], list(in_ref$external_gene_name), sum)
+
+#Aggregate counts by gene names
+ref_counts <- rowsum(counts_matrix[in_ref$ensembl_gene_id, ], in_ref$external_gene_name)
+```  
+
+## Create new seurat object
+```{r}
+ref.seurat <- CreateSeuratObject(counts = ref_counts,
+                   meta.data = seurat.refV1C@meta.data)
+```
+## Get umap and tsne
+```{r}
+umap_embeddings <- Embeddings(seurat.refV1C, reduction = "UMAP")
+tsne_embeddings <- Embeddings(seurat.refV1C, reduction = "tSNE")
+
+ref.seurat[["umap"]] <- CreateDimReducObject(embeddings = umap_embeddings, key = "UMAP_")
+ref.seurat[["tsne"]] <- CreateDimReducObject(embeddings = tsne_embeddings, key = "tSNE_")
+```
+
+# Filter out non neuronal clusters
+```{r}
+ref.seurat <- subset(ref.seurat, subset = cell_type == "neuron")
+DimPlot(ref.seurat, reduction = "umap", group.by = "cell_type")
+```
+
+## SCTransform and pca
+```{r}
+cc.genes <- cc.genes.updated.2019 #contains human cell cycle genes
+```
+
+```{r}
+ref.seurat <- NormalizeData(ref.seurat)
+ref.seurat <- CellCycleScoring(ref.seurat, 
+                     s.features = cc.genes$s.genes, 
+                     g2m.features = cc.genes$g2m.genes, 
+                     set.ident = FALSE)
+```
+
+```{r}
+options(future.globals.maxSize = 6 * 1024^3)  # Increase memory limit to  6GB to account for large data set
+ref.seurat <- SCTransform(ref.seurat, method = "glmGamPoi", assay = "RNA",
+            vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+```{r}
+ref.seurat <- RunPCA(ref.seurat)
+ref.seurat <- RunTSNE(ref.seurat, dims = 1:50, reduction.name = "sct_tsne") 
+ref.seurat <- RunUMAP(ref.seurat, dims = 1:50, reduction.name = "sct_umap")
+```
+
+## Import AIS genes for samples
+```{r}
+AIS <- read.csv("../originals/AIS_genes.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS$Expressed <- AIS$Symbol %in% rownames(samples.seuratmergeC[["SCT"]])
+
+#Remove False rows
+AIS_filtered <- AIS %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS_filtered <- AIS_filtered %>% distinct(Symbol, .keep_all = TRUE) %>% pull(Symbol)
+```
+
+```{r}
+AIS2 <- read.csv("../originals/AIS2.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS2$Expressed <- AIS2$Gene.product %in% rownames(samples.seuratmergeC[["SCT"]])
+
+#Remove False rows
+AIS2_filtered <- AIS2 %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS2_filtered <- AIS2_filtered %>% distinct(Gene.product, .keep_all = TRUE) %>% pull(Gene.product)
+```
+
+```{r}
+AIS_genes_samples <- unique(c(AIS_filtered, AIS2_filtered))
+```
+
+##Import AIS genes for ref
+```{r}
+AIS <- read.csv("../originals/AIS_genes.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS$Expressed <- AIS$Symbol %in% rownames(ref.seurat[["SCT"]])
+
+#Remove False rows
+AIS_filtered <- AIS %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS_filtered <- AIS_filtered %>% distinct(Symbol, .keep_all = TRUE) %>% pull(Symbol)
+```
+
+```{r}
+AIS2 <- read.csv("../originals/AIS2.csv", header = TRUE)
+
+#Check if gene is expressed
+AIS2$Expressed <- AIS2$Gene.product %in% rownames(ref.seurat[["SCT"]])
+
+#Remove False rows
+AIS2_filtered <- AIS2 %>% filter(Expressed == TRUE)
+
+#Remove duplicates and pull list
+AIS2_filtered <- AIS2_filtered %>% distinct(Gene.product, .keep_all = TRUE) %>% pull(Gene.product)
+```
+
+```{r}
+AIS_genes_ref <- unique(c(AIS_filtered, AIS2_filtered))
+```
+
+```{r}
+AIS_genes <- unique(c(AIS_genes_ref, AIS_genes_samples))
+```
+
+# Add column for iOSN and mOSN labels
+```{r}
+samples.seuratmergeC@meta.data %>%
+  group_by(SCT_snn_res.0.8) %>%
+  summarise(M1_avg_score = mean(Module_Score1),
+            M1_percent_exp = sum(Module_Score1 > 0.1)/n(),
+            M2_avg_score = mean(Module_Score2),
+            M2_percent_exp = sum(Module_Score2 > 0.1)/n())
+
+iOSN <- c(1, 4, 5)
+mOSN <- c(0, 2, 6, 7)
+iOSN_mOSN <- 3
+
+samples.seuratmergeC@meta.data$label <- 
+  ifelse(samples.seuratmergeC$seurat_clusters %in% iOSN, "iOSN",
+  ifelse(samples.seuratmergeC$seurat_clusters %in% mOSN, "mOSN",
+  ifelse(samples.seuratmergeC$seurat_clusters %in% iOSN_mOSN, "iOSN/mOSN", "NA")))
+
+DimPlot(samples.seuratmergeC, reduction = "harmony_umap", group.by = "label")
+DimPlot(samples.seuratmergeC, reduction = "harmony_umap", label = TRUE)
+FeaturePlot(samples.seuratmergeC, features = c("Module_Score1", "Module_Score2"), reduction = "harmony_umap")
+```
+
+## Subset to remove one cell
+```{r}
+samples.seurat <- subset(samples.seuratmergeC, cells = colnames(samples.seuratmergeC@assays$SCT@data))
+```
+
+##Merge layers
+```{r}
+samples.seurat <- JoinLayers(samples.seurat, assay = "RNA")
+```
+
+# Merge samples and ref
+```{r}
+samples.seurat@assays$SCT <- NULL
+ref.seurat@assays$SCT <- NULL
+
+DefaultAssay(samples.seurat) <- "RNA"
+DefaultAssay(ref.seurat) <- "RNA"
+
+sampleref.seurat <- merge(
+  x = ref.seurat, y = samples.seurat,
+  merge.data = TRUE,
+  project = "AIS"
+)
+```
+
+## SCT again
+```{r}
+sampleref.seurat <- NormalizeData(sampleref.seurat)
+
+options(future.globals.maxSize = 6 * 1024^3)  # Increase memory limit to  6GB to account for large data set
+sampleref.seurat <- SCTransform(sampleref.seurat, method = "glmGamPoi", assay = "RNA",
+            vars.to.regress = c("S.Score","G2M.Score"), verbose = FALSE)
+```
+
+## Add pca
+```{r}
+sampleref.seurat <- RunPCA(sampleref.seurat)
+```
+
+## Add metadata variable for grouping
+```{r}
+sampleref.seurat@meta.data$cell_class <- ifelse(
+  is.na(sampleref.seurat$label), sampleref.seurat$supercluster_term,
+  ifelse(is.na(sampleref.seurat$supercluster_term), sampleref.seurat$label, NA)
+)
+```
+
+## Split objects for features
+```{r}
+sample.list <- SplitObject(sampleref.seurat, split.by = "orig.ident")
+```
+
+## Remove genes not in the SCT slots of seurat objects
+```{r}
+AIS_genes_ref <- readRDS("../outputs/RDS_files/AIS_genes_ref.rds")
+AIS_genes_samples <- readRDS("../outputs/RDS_files/AIS_genes_sample.rds")
+AIS_genes <- readRDS("../outputs/RDS_files/AIS_genes.rds")
+
+missing_ref <- setdiff(AIS_genes, AIS_genes_ref)
+missing_samples <- setdiff(AIS_genes, AIS_genes_samples)
+
+AISG <- intersect(intersect(AIS_genes, AIS_genes_ref), AIS_genes_samples)
+```
+
+#Find integration anchors with RNA
+```{r}
+sample.list <- lapply(sample.list, function(sample) {
+  DefaultAssay(sample) <- "RNA"
+  return(sample)
+})
+
+sample.list <- lapply(sample.list, function(sample) {
+  sample <- NormalizeData(sample)
+  sample <- subset(sample, features = AISG)
+  sample <- ScaleData(sample)
+  return(sample)
+})
+
+#run pca
+sample.list <- lapply(X = sample.list, FUN = RunPCA, features = AISG)
+
+#Check RNA slot
+lapply(sample.list, function(sample) {
+   AISG[which(!AISG %in% rownames(sample@assays$RNA))]
+})
+
+OSN.anchors <- FindIntegrationAnchors(sample.list, anchor.features = AISG, reduction = "cca", assay = NULL, dims = 1:50)
+OSN.combined <- IntegrateData(anchorset = OSN.anchors, k.weight = 40)
+```
+
+##Run pca and umap
+```{r}
+OSN.anchors <- readRDS("../outputs/RDS_files/samples/OSN.anchors_june.rds")
+OSN.combinedRNA <- readRDS("../outputs/RDS_files/samples/OSN.combined_june.rds")
+```
+
+```{r}
+DefaultAssay(OSN.combinedRNA) <- "integrated"
+
+OSN.combinedRNA <- ScaleData(OSN.combinedRNA)
+
+OSN.combinedRNA <- RunPCA(OSN.combinedRNA , assay = "integrated")
+OSN.combinedRNA <- RunUMAP(OSN.combinedRNA , assay = "integrated", reduction = "pca",  dims = 1:50)
+```
+
+```{r}
+DimPlot(OSN.combinedRNA, reduction = "umap", group.by = "cell_class", label = TRUE)
+```
+# Extract data matrix for integrated
+```{r}
+matrix <- OSN.combinedRNA@assays[["integrated"]]@data
+
+AIS_genes_ref <- readRDS("../outputs/RDS_files/AIS_genes_ref.rds")
+AIS_genes_samples <- readRDS("../outputs/RDS_files/AIS_genes_sample.rds")
+AIS_genes <- readRDS("../outputs/RDS_files/AIS_genes.rds")
+ref.seurat <- readRDS("../outputs/RDS_files/ref.seurat2.rds")
+
+missing_genes <- setdiff(AIS_genes, rownames(OSN.combinedRNA))
+missing_genes <- intersect(missing_genes, rownames(ref.seurat))
+missing_genes2 <- intersect(missing_genes, rownames(samples.seurat)) # genes are not in AIS_specific list so not added
+```
+
+## Create and combine 0 matrix with integrated data slot
+```{r}
+mat <- matrix(0, length(missing_genes), ncol(matrix))
+rownames(mat) <- missing_genes
+colnames(mat) <- colnames(matrix)
+
+#get reference expression values
+ref.mat <- as.matrix(ref.seurat@assays$RNA@layers$data)
+colnames(ref.mat) <- colnames(ref.seurat)
+rownames(ref.mat) <- rownames(ref.seurat@assays$RNA@features)
+
+mat[,colnames(ref.seurat)] <- ref.mat[rownames(mat),]
+
+#rbind to rest of matrix
+feature_matrix <- rbind(mat, matrix)
+
+feature_matrix[1:5,1:5]
+#transpose
+feature_matrix <- t(feature_matrix)
+#scale
+feature_matrix <- scale(feature_matrix)
+```
+
+#Get mean expression levels 
+```{r}
+features <- data.frame(feature_matrix, cell_class = sampleref.seurat@meta.data$cell_class)
+
+features <- features %>%
+  group_by(cell_class) %>%
+  summarise(across(everything(), mean))
+```
+
+## Remove splatter and miscellenous
+```{r}
+# remove rows 7 and 8 
+features <- features[-c(7, 8), ]
+```
+
+## Group cell_class
+```{r}
+features$cell_class_group <- with(features, ifelse(
+  features$cell_class %in% c("CGE interneuron", "MGE interneuron", "LAMP5-LHX6 and Chandelier"), "GABAergic",
+  ifelse(features$cell_class %in% c("Upper-layer intratelencephalic", "Deep-layer intratelencephalic", "Deep-layer near-projecting", "Deep-layer corticothalamic and 6b"), "GLUTamatergic",
+         ifelse(features$cell_class == "iOSN", "iOSN",
+                ifelse(features$cell_class == "mOSN", "mOSN",
+                       ifelse(features$cell_class == "iOSN/mOSN", "iOSN/mOSN", "other"
+                              ))))))
+
+unique(features$cell_class_group)
+
+#remove cell_class
+features <- subset(features, select = -c(cell_class))
+
+features <- features %>%
+  group_by(cell_class_group) %>%
+  summarise(across(everything(), mean))
+
+#change cell_class_group to rownames
+features <- features %>% column_to_rownames(var = "cell_class_group")
+```
+
+##Subset list for specific AIS genes and remove mOSN row
+```{r}
+AIS_specific <- read.csv("../originals/AIS_specific.csv", header = TRUE)
+
+#subset list
+features_mat <- features[, colnames(features) %in% AIS_specific$Genes]
+
+#remove mOSN and re label iOSN/mOSN as mOSN
+features_mat <- features_mat[!rownames(features_mat) == "mOSN",]
+rownames(features_mat)[rownames(features_mat) == "iOSN/mOSN"] = "mOSN"
+```
+
+```{r}
+dists <- as.matrix(features_mat)
+heatmap(dists, scale = "none", )
+
+library(pheatmap)
+pheatmap <- pheatmap(dists, scale = "none")
+pheatmap
+```
+
+## Cutree with 2 clusters
+```{r}
+cutree2 <- cutree(pheatmap$tree_col, k = 2)
+
+cutree2_df <- as.data.frame(cutree2)
+clusters2 <- list()
+
+for (i in 1:2) {
+  clusters2[[i]] <- rownames(cutree2_df)[cutree2_df$cutree == i]
+}
+
+clusters2
+```
+
+## Plot boxplot for each cluster
+```{r}
+features_df <- rownames_to_column(features_mat, var = "cell_class_group")
+
+features_df <- pivot_longer(features_df,
+                            cols = where(is.numeric),  
+                            names_to = "Genes", 
+                            values_to = "Expression")
+
+
+#plot boxplots for 2
+boxplots <- lapply(1:2, function(cluster) {
+  features_df %>%
+    filter(Genes %in% clusters2[[cluster]]) %>%
+    ggplot(aes(x = cell_class_group, y = Expression, fill = cell_class_group)) +
+    geom_boxplot() +
+    theme_minimal() +
+    scale_fill_brewer(palette = "RdYlBu") +  
+    labs(y = "Scaled Expression", x = "Cell Type", title = paste("Gene Cluster", cluster))
+})
+```
+
+# Gene Ontology
+```{r}
+AIS_specific <- read.csv("../originals/AIS_specific.csv")
+
+GO <- lapply(clusters2, function(cluster) {
+AIS_go <- enrichGO(gene = cluster,
+                   ont = "BP",
+                   keyType = "SYMBOL",
+                   OrgDb = "org.Hs.eg.db",
+                   universe = AIS_specific$Genes,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+return(AIS_go)
+  })
+```
+
+```{r}
+results <- lapply(GO, function(x) {
+  cluster <- x@result  
+  cluster <- cluster[order(cluster$p.adjust),]
+  cluster <- cluster[order(cluster$qvalue),]
+  cluster <- cluster[order(cluster$pvalue),]
+  #cluster <- cluster[order(-cluster$FoldEnrichment), ]
+  return(cluster) 
+})
+
+```
+
+```{r}
+# Filter for top 10 terms
+results_filtered <- lapply(results, function(x){
+  x[1:10,]})
+```
+
+###Plot
+```{r}
+plot_function <- function(df, title) {
+  ggplot(df, aes(x = zScore, y = reorder(Description, zScore), fill = -log10(pvalue))) +  
+    geom_bar(stat = "identity", width = 0.5) +  
+    scale_fill_gradient(low = "blue", high = "red") +  
+    theme_minimal() +
+    labs(x = "zScore", y = "Term", title = title, fill = "-log10(pvalue)") +
+    theme(
+      axis.text.y = element_text(size = 10, colour = "black"),
+      axis.text.x = element_text(size = 12, colour = "black"),
+      axis.title = element_text(size = 14, colour = "black"),
+      plot.title = element_text(size = 16, face = "bold")
+    )
+}
+
+Go_plots <- lapply(seq_along(results_filtered), function(i) {
+  plot_function(results_filtered[[i]], paste("Enriched Gene Cluster", i))
+})
+```
+
+#Gene ontology with categories
+```{r}
+AIS_specific <- read.csv("../originals/AIS_genes_Sheet1.csv", header = TRUE)
+```
+
+```{r}
+all_categories <- unique(AIS_specific$Category)
+all_categories[4] <- "Enzyme"
+
+all_genes <- unique(AIS_specific$Genes)
+all_genes <-as.data.frame(all_genes)
+
+background <- as.data.frame(sapply(all_categories, function(cat) {
+  genes_in_cat <- AIS_specific$Genes[AIS_specific$Category == cat]
+  part_of <- length(genes_in_cat)
+  not_in_cat <- AIS_specific$Genes[AIS_specific$Category != cat]
+  not_part_of <- length(not_in_cat)
+  return(c("Part of" = part_of, "Not part of" = not_part_of))
+}))
+
+```
+
+```{r}
+cluster_summary <- list()
+
+cluster_summary <- lapply(clusters2, function(cluster_genes) {
+  summary <- as.data.frame(sapply(all_categories, function(cat) {
+    genes_in_cat <- AIS_specific$Genes[AIS_specific$Category == cat]
+    part_of <- sum(genes_in_cat %in% cluster_genes)
+    genes_not_in_cat <- AIS_specific$Genes[AIS_specific$Category != cat]
+    not_part_of <- sum(genes_not_in_cat %in% cluster_genes)
+    return(c("Part of" = part_of, "Not part of" = not_part_of))
+  }))
+  return(summary)
+})
+```
+
+## Fisher's exact test
+```{r}
+Fisher <- lapply(cluster_summary, function(x) {
+  x <- t(x)
+  back <- t(background)
+  colnames(back) <- c("bg_part", "bg_not_part")
+  test <- as.data.frame(cbind(x, back))
+  return(test)
+})
+```
+
+```{r}
+Fishers_test <- lapply(Fisher, function(df){
+  out <- bind_rows(apply(df, 1, function(line){
+     dat <- matrix(line, nrow =2, byrow = T)
+      fisher.out <- fisher.test(dat)
+      data.frame(pvalue = fisher.out$p.value,
+                 estimate = fisher.out$estimate)
+  }))
+  rownames(out) <- rownames(df)
+  out
+})
+```
+
+```{r}
+names(Fishers_test) <- paste0("Gene Cluster", seq_along(Fishers_test))
+
+long_df <- bind_rows(
+  lapply(names(Fishers_test), function(cluster) {
+    df <- Fishers_test[[cluster]]
+    df$category <- rownames(df) 
+    df$cluster <- cluster
+    return(df)
+  })
+)
+
+category_dotplot <- ggplot(long_df, aes(x = cluster, y = category)) +
+  geom_point(aes(size = estimate, fill = -log10(pvalue)),
+    shape = 21, stroke = 0.5) +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  labs(x = "Gene Cluster", y = "Category", colour = "P-value", size = "Estimate")
+```
